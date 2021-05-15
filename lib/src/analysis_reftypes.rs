@@ -2,8 +2,9 @@
 
 use crate::data_structures::*;
 use crate::sparse_set::{SparseSet, SparseSetU};
-use std::{fmt, hash::Hash};
 
+use alloc::vec::Vec;
+use core::{fmt, hash::Hash};
 use log::debug;
 use smallvec::SmallVec;
 

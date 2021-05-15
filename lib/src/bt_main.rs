@@ -3,10 +3,16 @@
 
 //! Core implementation of the backtracking allocator.
 
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use core::default;
+use core::fmt;
 use log::{debug, info, log_enabled, Level};
 use smallvec::SmallVec;
-use std::default;
-use std::fmt;
 
 use crate::analysis_data_flow::{add_raw_reg_vecs_for_insn, does_inst_use_def_or_mod_reg};
 use crate::analysis_main::{run_analysis, AnalysisInfo};

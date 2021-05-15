@@ -3,8 +3,9 @@
 //! AVL tree internals are public, so that backtracking.rs can do custom
 //! traversals of the tree as it wishes.
 
+use alloc::vec::Vec;
+use core::cmp::Ordering;
 use smallvec::SmallVec;
-use std::cmp::Ordering;
 
 //=============================================================================
 // Data structures for AVLTree
@@ -1051,7 +1052,7 @@ impl<T: Clone + PartialOrd> AVLTree<T> {
 #[cfg(test)]
 mod avl_tree_test_utils {
     use crate::data_structures::Set;
-    use std::cmp::Ordering;
+    use core::cmp::Ordering;
 
     // Perform various checks on the tree, and assert if it is not OK.
     pub fn check_tree(
@@ -1223,7 +1224,7 @@ fn test_avl_tree1() {
 
 #[test]
 fn test_avl_tree2() {
-    use std::cmp::Ordering;
+    use core::cmp::Ordering;
 
     // Do some simple testing using a custom comparator, which inverts the order
     // of items in the tree, so as to check custom comparators work right.

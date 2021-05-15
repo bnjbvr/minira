@@ -10,7 +10,8 @@ use crate::{
 use crate::{reg_maps::VrangeRegUsageMapper, Function, RegAllocError};
 use log::trace;
 
-use std::result::Result;
+use alloc::{string::String, vec, vec::Vec};
+use core::result::Result;
 
 //=============================================================================
 // InstToInsert and InstToInsertAndPoint

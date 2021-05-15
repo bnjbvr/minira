@@ -11,6 +11,8 @@ use crate::data_structures::{
 use crate::union_find::UnionFindEquivClasses;
 use crate::Function;
 
+use alloc::{vec, vec::Vec};
+
 //=============================================================================
 // A spill slot allocator.  This could be implemented more simply than it is.
 // The reason for the extra complexity is to support copy-coalescing at the

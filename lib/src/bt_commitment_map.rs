@@ -3,8 +3,8 @@
 
 //! Backtracking allocator: per-real-register commitment maps
 
-use std::cmp::Ordering;
-use std::fmt;
+use core::cmp::Ordering;
+use core::fmt;
 
 use crate::avl_tree::{AVLTree, AVL_NULL};
 use crate::data_structures::{

@@ -9,7 +9,7 @@
 
 use crate::data_structures::RegVecs;
 use crate::*;
-use std::borrow::Cow;
+use alloc::borrow::Cow;
 
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};

@@ -1,9 +1,10 @@
 //! Performs dataflow and liveness analysis, including live range construction.
 
+use alloc::{format, string::ToString, vec, vec::Vec};
+use core::cmp::min;
+use core::fmt;
 use log::{debug, info, log_enabled, Level};
 use smallvec::{smallvec, SmallVec};
-use std::cmp::min;
-use std::fmt;
 
 use crate::data_structures::*;
 use crate::sparse_set::SparseSet;
@@ -702,7 +703,7 @@ pub fn calc_livein_and_liveout<F: Function>(
             sum_card_live_in += liveins[bix].card();
             sum_card_live_out += liveouts[bix].card();
         }
-        println!(
+        info!(
             "QQQQ calc_LI/LO: num_evals {}, tot LI {}, tot LO {}",
             num_evals, sum_card_live_in, sum_card_live_out
         );

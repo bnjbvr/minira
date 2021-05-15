@@ -62,11 +62,12 @@ use crate::inst_stream::{ExtPoint, InstExtPoint, InstToInsertAndExtPoint};
 use crate::{analysis_data_flow::get_san_reg_sets_for_insn, StackmapRequestInfo};
 use crate::{Function, RegUsageMapper};
 
-use rustc_hash::FxHashSet;
-use std::collections::VecDeque;
-use std::default::Default;
-use std::hash::Hash;
-use std::result::Result;
+use alloc::{collections::VecDeque, vec, vec::Vec};
+use core::default::Default;
+use core::hash::{BuildHasherDefault, Hash};
+use core::result::Result;
+use hashbrown::HashSet;
+use rustc_hash::FxHasher;
 
 use log::debug;
 
@@ -435,7 +436,7 @@ pub(crate) struct Checker {
     bb_in: Map<BlockIx, CheckerState>,
     bb_succs: Map<BlockIx, Vec<BlockIx>>,
     bb_insts: Map<BlockIx, Vec<Inst>>,
-    reftyped_vregs: FxHashSet<VirtualReg>,
+    reftyped_vregs: HashSet<VirtualReg, BuildHasherDefault<FxHasher>>,
     has_run: bool,
 }
 
@@ -490,7 +491,7 @@ impl Checker {
 
         bb_in.insert(f.entry_block(), CheckerState::entry_state(ru));
 
-        let reftyped_vregs = reftyped_vregs.iter().cloned().collect::<FxHashSet<_>>();
+        let reftyped_vregs = reftyped_vregs.iter().cloned().collect::<HashSet<_, _>>();
         Checker {
             bb_entry: f.entry_block(),
             bb_in,

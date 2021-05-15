@@ -4,7 +4,10 @@
 //! An implementation of a fast union-find implementation for "T: ToFromU32" items
 //! in some dense range [0, N-1].
 
-use std::marker::PhantomData;
+#[cfg(test)]
+use alloc::vec;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
 
 //=============================================================================
 // ToFromU32
@@ -545,6 +548,7 @@ impl<'a, T: ToFromU32> Iterator for UnionFindEquivClassLeadersIter<'a, T> {
 #[cfg(test)]
 mod union_find_test_utils {
     use super::UnionFindEquivClasses;
+    use alloc::{vec, vec::Vec};
     // Test that the eclass for `elem` is `expected` (modulo ordering).
     pub fn test_eclass(eclasses: &UnionFindEquivClasses<u32>, elem: u32, expected: &Vec<u32>) {
         let mut expected_sorted = expected.clone();

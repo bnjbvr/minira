@@ -6,9 +6,12 @@
 
 use log::{info, log_enabled, trace, Level};
 
+use alloc::{format, vec, vec::Vec};
+use core::fmt;
+use core::{cmp::Ordering, default};
+
+#[cfg(feature = "lsra-tweaks")]
 use std::env;
-use std::fmt;
-use std::{cmp::Ordering, default};
 
 use crate::{
     checker::CheckerContext, reg_maps::MentionRegUsageMapper, Function, RealRegUniverse,
@@ -55,7 +58,7 @@ impl Drop for Statistics {
         if self.only_large && self.num_vregs < 1000 {
             return;
         }
-        println!(
+        info!(
             "stats: {} fixed; {} vreg; {} vranges; {} peak-active; {} peak-inactive, {} direct-alloc; {} total-alloc; {} partial-splits; {} partial-splits-attempts",
             self.num_fixed,
             self.num_vregs,
@@ -74,6 +77,7 @@ impl Drop for Statistics {
 /// TODO Consider loop depth to avoid splitting in the middle of a loop
 /// whenever possible.
 #[derive(Copy, Clone, Debug)]
+#[cfg_attr(not(feature = "lsra-tweaks"), allow(dead_code))]
 enum OptimalSplitStrategy {
     From,
     To,
@@ -94,6 +98,18 @@ pub struct LinearScanOptions {
 }
 
 impl default::Default for LinearScanOptions {
+    #[cfg(not(feature = "lsra-tweaks"))]
+    fn default() -> Self {
+        Self {
+            split_strategy: OptimalSplitStrategy::From,
+            partial_split: false,
+            partial_split_near_end: false,
+            stats: false,
+            large_stats: false,
+        }
+    }
+
+    #[cfg(feature = "lsra-tweaks")]
     fn default() -> Self {
         // Useful for debugging.
         let optimal_split_strategy = match env::var("LSRA_SPLIT") {

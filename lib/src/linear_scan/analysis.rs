@@ -13,9 +13,10 @@ use crate::{
     union_find::UnionFind,
     AnalysisError, Function, RealRegUniverse, RegClass, StackmapRequestInfo, TypedIxVec,
 };
+use alloc::{format, vec, vec::Vec};
+use core::{cmp::Ordering, fmt, mem};
 use log::{debug, info, log_enabled, trace, Level};
 use smallvec::{smallvec, SmallVec};
-use std::{cmp::Ordering, fmt, mem};
 
 #[derive(Clone, Copy, PartialEq, Eq, Ord)]
 pub(crate) enum BlockPos {

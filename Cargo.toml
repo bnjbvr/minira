@@ -21,9 +21,9 @@ name = "minira"
 path = "./bin/minira_lib.rs"
 
 [dependencies]
-regalloc =  { path = "./lib", features = ["fuzzing", "enable-serde"] }
+regalloc =  { path = "./lib", features = ["fuzzing", "enable-serde", "lsra-tweaks"] }
 arbitrary = { version = "0.4.0", features = ["derive"]}
-rustc-hash = "1.0.1"
+rustc-hash = { version = "1.0.1", default-features = false }
 log = { version = "0.4.8", default-features = false }
 pretty_env_logger = "0.4.0"
 clap = "2.33.0"

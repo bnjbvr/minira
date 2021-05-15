@@ -2,6 +2,10 @@
 
 use crate::data_structures::WritableBase;
 use crate::{RealRegUniverse, Reg, Writable};
+use alloc::{
+    format,
+    string::{String, ToString},
+};
 
 /// A trait for printing instruction bits and pieces, with the the ability to take a
 /// contextualising `RealRegUniverse` that is used to give proper names to registers.

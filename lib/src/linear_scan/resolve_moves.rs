@@ -7,10 +7,13 @@ use crate::{
     Function, RealReg, Reg, SpillSlot, TypedIxVec, VirtualReg, Writable,
 };
 
+use alloc::vec::Vec;
+use core::fmt;
 use log::{debug, info, trace};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
-use std::fmt;
+
+type HashMap<K, V> = hashbrown::HashMap<K, V, core::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+type HashSet<T> = hashbrown::HashSet<T, core::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
 fn resolve_moves_in_block<F: Function>(
     func: &F,

@@ -3,8 +3,14 @@
 
 //! Backtracking allocator: the as-yet-unallocated VirtualReg LR prio queue.
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use alloc::{
+    collections::BinaryHeap,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use core::cmp::Ordering;
 
 use crate::data_structures::{TypedIxVec, VirtualRange, VirtualRangeIx};
 

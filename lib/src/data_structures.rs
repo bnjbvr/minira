@@ -1,16 +1,22 @@
 //! Data structures for the whole crate.
 
-use rustc_hash::FxHashMap;
-use rustc_hash::FxHashSet;
+use hashbrown::{HashMap, HashSet};
+use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 
-use std::cmp::Ordering;
-use std::collections::VecDeque;
-use std::fmt;
-use std::hash::Hash;
-use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut, Index, IndexMut};
-use std::slice::{Iter, IterMut};
+use alloc::{
+    collections::VecDeque,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use core::cmp::Ordering;
+use core::fmt;
+use core::hash::{BuildHasherDefault, Hash};
+use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut, Index, IndexMut};
+use core::slice::{Iter, IterMut};
 
 use crate::{Function, RegUsageMapper};
 
@@ -27,25 +33,25 @@ pub type Queue<T> = VecDeque<T>;
 
 // NOTE: plain HashMap is nondeterministic, even in a single-threaded
 // scenario, which can make debugging code that uses it really confusing.  So
-// we use FxHashMap instead, as it *is* deterministic, and, allegedly, faster
+// we use the FxHasher instead, as it *is* deterministic, and, allegedly, faster
 // too.
-pub type Map<K, V> = FxHashMap<K, V>;
+pub type Map<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 //=============================================================================
 // Sets of things
 
-// Same comment as above for FxHashMap.
+// Same comment as above for HashMap.
 #[derive(Clone)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub struct Set<T: Eq + Hash> {
-    set: FxHashSet<T>,
+    set: HashSet<T, BuildHasherDefault<FxHasher>>,
 }
 
 impl<T: Eq + Ord + Hash + Copy + fmt::Debug> Set<T> {
     #[inline(never)]
     pub fn empty() -> Self {
         Self {
-            set: FxHashSet::<T>::default(),
+            set: HashSet::<T, _>::default(),
         }
     }
 
@@ -91,7 +97,7 @@ impl<T: Eq + Ord + Hash + Copy + fmt::Debug> Set<T> {
 
     #[inline(never)]
     pub fn intersect(&mut self, other: &Self) {
-        let mut res = FxHashSet::<T>::default();
+        let mut res = HashSet::<T, _>::default();
         for item in self.set.iter() {
             if other.set.contains(item) {
                 res.insert(*item);
@@ -189,7 +195,7 @@ impl<T: Eq + Ord + Hash + Copy + fmt::Debug> fmt::Debug for Set<T> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         // Print the elements in some way which depends only on what is
         // present in the set, and not on any other factor.  In particular,
-        // <Debug for FxHashSet> has been observed to to print the elements
+        // <Debug for HashSet> has been observed to to print the elements
         // of a two element set in both orders on different occasions.
         let sorted_vec = self.to_vec();
         let mut s = "{".to_string();
@@ -205,7 +211,7 @@ impl<T: Eq + Ord + Hash + Copy + fmt::Debug> fmt::Debug for Set<T> {
 }
 
 pub struct SetIter<'a, T> {
-    set_iter: std::collections::hash_set::Iter<'a, T>,
+    set_iter: hashbrown::hash_set::Iter<'a, T>,
 }
 impl<T: Eq + Hash> Set<T> {
     pub fn iter(&self) -> SetIter<T> {

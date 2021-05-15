@@ -4,9 +4,11 @@
 //! An implementation of sets which aims to be fast for both large sets and
 //! very small sets, even if the elements are sparse relative to the universe.
 
-use rustc_hash::FxHashSet;
-use std::fmt;
-use std::hash::Hash;
+use alloc::{format, string::ToString, vec::Vec};
+use core::fmt;
+use core::hash::{BuildHasherDefault, Hash};
+use hashbrown::HashSet;
+use rustc_hash::FxHasher;
 
 //=============================================================================
 // SparseSet
@@ -44,8 +46,13 @@ impl_array!(2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 20, 24, 28, 32);
 // in `Small::arr` are in no particular order, although they are
 // duplicate-free.
 pub enum SparseSetU<A: Array> {
-    Large { set: FxHashSet<A::Item> },
-    Small { card: usize, arr: MaybeUninit<A> },
+    Large {
+        set: HashSet<A::Item, BuildHasherDefault<FxHasher>>,
+    },
+    Small {
+        card: usize,
+        arr: MaybeUninit<A>,
+    },
 }
 
 // ================ Admin (private) methods ================
@@ -74,7 +81,7 @@ where
             SparseSetU::Large { .. } => panic!("SparseSetU: upgrade"),
             SparseSetU::Small { card, arr } => {
                 assert!(*card == A::size());
-                let mut set = FxHashSet::<A::Item>::default();
+                let mut set = HashSet::<A::Item, _>::default();
                 set.reserve(A::size());
                 // Could this be done faster?
                 let arr_p = arr.as_mut_ptr() as *mut A::Item;
@@ -494,7 +501,7 @@ where
             }
             SparseSetU::Small { card, arr }
         } else {
-            let mut set = FxHashSet::<A::Item>::default();
+            let mut set = HashSet::<A::Item, _>::default();
             for i in 0..vec_len {
                 set.insert(vec[i]);
             }
@@ -593,7 +600,7 @@ where
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         // Print the elements in some way which depends only on what is
         // present in the set, and not on any other factor.  In particular,
-        // <Debug for FxHashSet> has been observed to to print the elements
+        // <Debug for HashSet> has been observed to to print the elements
         // of a two element set in both orders on different occasions.
         let sorted_vec = self.to_vec();
         let mut s = "{".to_string();
@@ -630,7 +637,7 @@ where
 
 pub enum SparseSetUIter<'a, A: Array> {
     Large {
-        set_iter: std::collections::hash_set::Iter<'a, A::Item>,
+        set_iter: hashbrown::hash_set::Iter<'a, A::Item>,
     },
     Small {
         card: usize,
@@ -675,6 +682,8 @@ impl<'a, A: Array> Iterator for SparseSetUIter<'a, A> {
 
 #[cfg(test)]
 mod sparse_set_test_utils {
+    use alloc::{vec, vec::Vec};
+
     // As currently set up, each number (from rand, not rand_base) has a 1-in-4
     // chance of being a dup of the last 8 numbers produced.
     pub struct RNGwithDups {

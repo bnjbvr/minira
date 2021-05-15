@@ -1,5 +1,10 @@
 //! Top level module for all analysis activities.
 
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 use log::{debug, info};
 
 use crate::data_structures::*;
@@ -344,7 +349,7 @@ impl DepthBasedFrequencies {
     pub(crate) fn len(&self) -> u32 {
         self.0.len()
     }
-    pub(crate) fn iter(&self) -> std::slice::Iter<u32> {
+    pub(crate) fn iter(&self) -> core::slice::Iter<u32> {
         self.0.iter()
     }
     #[inline(always)]
