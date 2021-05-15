@@ -386,8 +386,8 @@ impl Arbitrary for Func {
             bix: BlockIx::new(0),
         });
 
-        let mut insts = TypedIxVec::new();
-        let mut blocks = TypedIxVec::new();
+        let mut insts = vec![];
+        let mut blocks = vec![];
 
         let mut cur_block = 0;
 
@@ -417,8 +417,8 @@ impl Arbitrary for Func {
             let len = insts.len() - start;
             let block = Block {
                 name: format!("b{}", cur_block),
-                start: InstIx::new(start),
-                len,
+                start: InstIx::new(start as u32),
+                len: len as u32,
                 estimated_execution_frequency: 0,
             };
             blocks.push(block);

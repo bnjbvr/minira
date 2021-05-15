@@ -60,6 +60,7 @@ use crate::data_structures::{
 };
 use crate::inst_stream::{ExtPoint, InstExtPoint, InstToInsertAndExtPoint};
 use crate::{analysis_data_flow::get_san_reg_sets_for_insn, StackmapRequestInfo};
+use crate::{Alloc, BumpVec};
 use crate::{Function, RegUsageMapper};
 
 use rustc_hash::FxHashSet;
@@ -626,26 +627,28 @@ impl Checker {
 
 /// A wrapper around `Checker` that assists its use with `InstToInsertAndExtPoint`s and
 /// `Function` together.
-pub(crate) struct CheckerContext {
+pub(crate) struct CheckerContext<'a> {
     checker: Checker,
     checker_inst_map: Map<InstExtPoint, Vec<Inst>>,
+    alloc: Alloc<'a>,
 }
 
 /// Full infromation needed by the checker for checking reference types.
 pub(crate) struct CheckerStackmapInfo<'a> {
     pub(crate) request: &'a StackmapRequestInfo,
-    pub(crate) stackmaps: &'a [Vec<SpillSlot>],
+    pub(crate) stackmaps: &'a [BumpVec<'a, SpillSlot>],
 }
 
-impl CheckerContext {
+impl<'a> CheckerContext<'a> {
     /// Create a new checker context for the given function, which is about to be edited with the
     /// given instruction insertions.
     pub(crate) fn new<F: Function>(
         f: &F,
         ru: &RealRegUniverse,
-        insts_to_add: &Vec<InstToInsertAndExtPoint>,
+        insts_to_add: &[InstToInsertAndExtPoint],
         stackmap_info: Option<CheckerStackmapInfo>,
-    ) -> CheckerContext {
+        alloc: &Alloc<'a>,
+    ) -> CheckerContext<'a> {
         let mut checker_inst_map: Map<InstExtPoint, Vec<Inst>> = Map::default();
         for &InstToInsertAndExtPoint { ref inst, ref iep } in insts_to_add {
             let checker_insts = checker_inst_map
@@ -663,7 +666,7 @@ impl CheckerContext {
                 .zip(info.stackmaps.iter())
             {
                 let iep = InstExtPoint::new(*iix, ExtPoint::Use);
-                let mut slots = slots.clone();
+                let mut slots: Vec<_> = slots.iter().cloned().collect();
                 slots.sort();
                 checker_inst_map
                     .entry(iep)
@@ -682,6 +685,7 @@ impl CheckerContext {
         CheckerContext {
             checker,
             checker_inst_map,
+            alloc: alloc.clone(),
         }
     }
 
@@ -714,7 +718,7 @@ impl CheckerContext {
         }
 
         if !skip_inst {
-            let regsets = get_san_reg_sets_for_insn::<F>(func.get_insn(iix), ru)
+            let regsets = get_san_reg_sets_for_insn::<F>(func.get_insn(iix), ru, &self.alloc)
                 .expect("only existing real registers at this point");
             assert!(regsets.is_sanitized());
 

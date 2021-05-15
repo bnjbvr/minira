@@ -4,7 +4,9 @@ mod test_cases;
 mod test_framework;
 mod validator;
 
-use regalloc::{allocate_registers_with_opts, Algorithm, BacktrackingOptions, IRSnapshot, Options};
+use regalloc::{
+    allocate_registers_with_opts, Algorithm, Alloc, BacktrackingOptions, Bump, IRSnapshot, Options,
+};
 use test_framework::{make_universe, run_func, RunStage};
 use validator::check_results;
 
@@ -127,11 +129,14 @@ fn main() {
     let original_func = func.clone();
     let stackmap_request = func.get_stackmap_request();
 
+    let bump = Bump::new();
+    let alloc = Alloc(&bump);
     let result = match allocate_registers_with_opts(
         &mut func,
         &reg_universe,
         stackmap_request.as_ref(),
         opts.clone(),
+        &alloc,
     ) {
         Err(e) => {
             println!("allocation failed: {}", e);
@@ -177,7 +182,11 @@ fn main() {
         println!("Re-running as snapshotted test case...");
         let mut snapshot = IRSnapshot::from_function(&original_func, &reg_universe);
         println!("Constructed snapshot, running...");
-        snapshot.allocate(opts).expect("generic allocation failed!");
+        let bump = Bump::new();
+        let alloc = Alloc(&bump);
+        snapshot
+            .allocate(opts, &alloc)
+            .expect("generic allocation failed!");
         println!("Success!");
     }
 }
@@ -234,7 +243,9 @@ fn run_snapshot(path: &str, opts: Options, quiet: bool) {
         if !quiet {
             println!("Running regalloc on snapshot {}...", i);
         }
-        match snapshot.allocate(opts.clone()) {
+        let bump = Bump::new();
+        let alloc = Alloc(&bump);
+        match snapshot.allocate(opts.clone(), &alloc) {
             Ok(result) => {
                 if !quiet {
                     println!("allocation of snapshotted IR {} worked!", i);
@@ -245,16 +256,15 @@ fn run_snapshot(path: &str, opts: Options, quiet: bool) {
             Err(err) => {
                 panic!("allocation failed! {}", err);
             }
-        }
+        }; // drop the RegAallocResult before the `bump` arena
     }
 }
 
 #[cfg(test)]
 mod test_utils {
-    use regalloc::{allocate_registers, AlgorithmWithDefaults, RegAllocError, RegAllocResult};
+    use regalloc::{allocate_registers, AlgorithmWithDefaults, RegAllocError};
 
     use super::*;
-    use crate::test_framework::Func;
 
     pub fn check_bt(func_name: &str, num_gpr: usize, num_fpu: usize) {
         check_bt_internal(func_name, num_gpr, num_fpu, /* use_checker = */ false);
@@ -276,9 +286,12 @@ mod test_utils {
             }),
         };
 
+        let bump = Bump::new();
+        let alloc = Alloc(&bump);
+
         let mut encoded = IRSnapshot::from_function(&func, &reg_universe);
         encoded
-            .allocate(opts.clone())
+            .allocate(opts.clone(), &alloc)
             .expect("generic allocator failed!");
 
         let before_regalloc_result = run_func(
@@ -288,10 +301,13 @@ mod test_utils {
             RunStage::BeforeRegalloc,
         );
         let sri = func.get_stackmap_request();
-        let result = allocate_registers_with_opts(&mut func, &reg_universe, sri.as_ref(), opts)
-            .unwrap_or_else(|err| {
-                panic!("allocation failed: {}", err);
-            });
+        let bump = Bump::new();
+        let alloc = Alloc(&bump);
+        let result =
+            allocate_registers_with_opts(&mut func, &reg_universe, sri.as_ref(), opts, &alloc)
+                .unwrap_or_else(|err| {
+                    panic!("allocation failed: {}", err);
+                });
 
         func.update_from_alloc(result);
         let after_regalloc_result = run_func(
@@ -304,20 +320,20 @@ mod test_utils {
     }
 
     // Note: num_gpr/num_fpu: must include the scratch register.
-    pub fn run_lsra(
-        func_name: &str,
-        num_gpr: usize,
-        num_fpu: usize,
-    ) -> Result<RegAllocResult<Func>, RegAllocError> {
+    pub fn run_lsra(func_name: &str, num_gpr: usize, num_fpu: usize) -> Result<(), RegAllocError> {
         let _ = pretty_env_logger::try_init();
         let mut func = test_cases::find_func(func_name).unwrap();
         let reg_universe = make_universe(num_gpr, num_fpu);
+        let bump = Bump::new();
+        let alloc = Alloc(&bump);
         allocate_registers(
             &mut func,
             &reg_universe,
             None,
             AlgorithmWithDefaults::LinearScan,
+            &alloc,
         )
+        .map(|_| ())
     }
 
     // Note: num_gpr/num_fpu: must include the scratch register.
@@ -338,16 +354,20 @@ mod test_utils {
             algorithm: Algorithm::LinearScan(Default::default()),
         };
 
+        let bump = Bump::new();
+        let alloc = Alloc(&bump);
+
         let mut encoded = IRSnapshot::from_function(&func, &reg_universe);
         encoded
-            .allocate(opts.clone())
+            .allocate(opts.clone(), &alloc)
             .expect("generic allocator failed!");
 
         let sri = func.get_stackmap_request();
-        let result = allocate_registers_with_opts(&mut func, &reg_universe, sri.as_ref(), opts)
-            .unwrap_or_else(|err| {
-                panic!("allocation failed: {}", err);
-            });
+        let result =
+            allocate_registers_with_opts(&mut func, &reg_universe, sri.as_ref(), opts, &alloc)
+                .unwrap_or_else(|err| {
+                    panic!("allocation failed: {}", err);
+                });
         func.update_from_alloc(result);
         func.print("AFTER", &None);
 
@@ -386,14 +406,22 @@ mod test_utils {
             let mut func = func.clone();
             let reg_universe = make_universe(num_gpr, 0);
 
+            let bump = Bump::new();
+            let alloc = Alloc(&bump);
+
             let mut encoded = IRSnapshot::from_function(&func, &reg_universe);
             encoded
-                .allocate(opts.clone())
+                .allocate(opts.clone(), &alloc)
                 .expect("generic allocator failed!");
 
-            let result =
-                allocate_registers_with_opts(&mut func, &reg_universe, sri.as_ref(), opts.clone())
-                    .expect("regalloc failure");
+            let result = allocate_registers_with_opts(
+                &mut func,
+                &reg_universe,
+                sri.as_ref(),
+                opts.clone(),
+                &alloc,
+            )
+            .expect("regalloc failure");
 
             func.update_from_alloc(result);
             func.print("AFTER", &None);

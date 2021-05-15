@@ -2,7 +2,6 @@
 
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
-use smallvec::SmallVec;
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
@@ -12,6 +11,7 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::slice::{Iter, IterMut};
 
+use crate::{Alloc, BumpSmallVec, BumpVec};
 use crate::{Function, RegUsageMapper};
 
 #[cfg(feature = "enable-serde")]
@@ -315,29 +315,29 @@ impl<T: Copy + PartialOrd + PlusN> Iterator for MyIterator<T> {
 // Vectors where both the index and element types can be specified (and at
 // most 2^32-1 elems can be stored.  What if this overflows?)
 
-pub struct TypedIxVec<TyIx, Ty> {
-    vek: Vec<Ty>,
+pub struct TypedIxVec<'a, TyIx, Ty> {
+    vek: BumpVec<'a, Ty>,
     ty_ix: PhantomData<TyIx>,
 }
 
-impl<TyIx, Ty> TypedIxVec<TyIx, Ty>
+impl<'a, TyIx, Ty> TypedIxVec<'a, TyIx, Ty>
 where
     Ty: Clone,
     TyIx: Copy + Eq + Ord + Zero + PlusN + Into<u32>,
 {
-    pub fn new() -> Self {
+    pub fn new(alloc: &Alloc<'a>) -> Self {
         Self {
-            vek: Vec::new(),
+            vek: alloc.vec(16),
             ty_ix: PhantomData::<TyIx>,
         }
     }
-    pub fn from_vec(vek: Vec<Ty>) -> Self {
+    pub fn from_vec(vek: BumpVec<'a, Ty>) -> Self {
         Self {
             vek,
             ty_ix: PhantomData::<TyIx>,
         }
     }
-    pub fn append(&mut self, other: &mut TypedIxVec<TyIx, Ty>) {
+    pub fn append(&mut self, other: &mut TypedIxVec<'a, TyIx, Ty>) {
         // FIXME what if this overflows?
         self.vek.append(&mut other.vek);
     }
@@ -384,7 +384,7 @@ where
     }
 }
 
-impl<TyIx, Ty> Index<TyIx> for TypedIxVec<TyIx, Ty>
+impl<'a, TyIx, Ty> Index<TyIx> for TypedIxVec<'a, TyIx, Ty>
 where
     TyIx: Into<u32>,
 {
@@ -394,7 +394,7 @@ where
     }
 }
 
-impl<TyIx, Ty> IndexMut<TyIx> for TypedIxVec<TyIx, Ty>
+impl<'a, TyIx, Ty> IndexMut<TyIx> for TypedIxVec<'a, TyIx, Ty>
 where
     TyIx: Into<u32>,
 {
@@ -403,7 +403,7 @@ where
     }
 }
 
-impl<TyIx, Ty> Clone for TypedIxVec<TyIx, Ty>
+impl<'a, TyIx, Ty> Clone for TypedIxVec<'a, TyIx, Ty>
 where
     Ty: Clone,
 {
@@ -527,7 +527,7 @@ generate_boilerplate!(VirtualRangeIx, VirtualRange, "vr");
 
 generate_boilerplate!(RealRangeIx, RealRange, "rr");
 
-impl<TyIx, Ty: fmt::Debug> fmt::Debug for TypedIxVec<TyIx, Ty> {
+impl<'a, TyIx, Ty: fmt::Debug> fmt::Debug for TypedIxVec<'a, TyIx, Ty> {
     // This is something of a hack in the sense that it doesn't show the
     // indices, but oh well ..
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
@@ -1108,16 +1108,16 @@ impl RegVecBounds {
 
 // This is the primary structure.  We compute just one of these for an entire
 // function.
-pub struct RegVecsAndBounds {
+pub struct RegVecsAndBounds<'a> {
     // The three vectors of registers.  These can be arbitrarily long.
     pub vecs: RegVecs,
     // Admin info which tells us the location, for each insn, of its register
     // groups in `vecs`.
-    pub bounds: TypedIxVec<InstIx, RegVecBounds>,
+    pub bounds: TypedIxVec<'a, InstIx, RegVecBounds>,
 }
 
-impl RegVecsAndBounds {
-    pub fn new(vecs: RegVecs, bounds: TypedIxVec<InstIx, RegVecBounds>) -> Self {
+impl<'a> RegVecsAndBounds<'a> {
+    pub fn new(vecs: RegVecs, bounds: TypedIxVec<'a, InstIx, RegVecBounds>) -> Self {
         Self { vecs, bounds }
     }
     pub fn is_sanitized(&self) -> bool {
@@ -1159,7 +1159,7 @@ impl RegSets {
     }
 }
 
-impl RegVecsAndBounds {
+impl<'a> RegVecsAndBounds<'a> {
     /* !!not RegSets!! */
     #[inline(never)]
     // Convenience function.  Try to avoid using this.
@@ -1760,23 +1760,23 @@ impl fmt::Debug for RangeFragMetrics {
 // RangeFragIxs refer, is not stored here.
 
 #[derive(Clone)]
-pub(crate) struct SortedRangeFragIxs(SmallVec<[RangeFragIx; 4]>);
+pub(crate) struct SortedRangeFragIxs<'a>(BumpSmallVec<'a, [RangeFragIx; 4]>);
 
-impl fmt::Debug for SortedRangeFragIxs {
+impl<'a> fmt::Debug for SortedRangeFragIxs<'a> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         self.0.fmt(fmt)
     }
 }
 
-impl Deref for SortedRangeFragIxs {
-    type Target = SmallVec<[RangeFragIx; 4]>;
+impl<'a> Deref for SortedRangeFragIxs<'a> {
+    type Target = BumpSmallVec<'a, [RangeFragIx; 4]>;
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl SortedRangeFragIxs {
+impl<'a> SortedRangeFragIxs<'a> {
     fn check(&self, fenv: &TypedIxVec<RangeFragIx, RangeFrag>) {
         for i in 1..self.0.len() {
             let prev_frag = &fenv[self.0[i - 1]];
@@ -1788,7 +1788,7 @@ impl SortedRangeFragIxs {
     }
 
     fn sort(&mut self, fenv: &TypedIxVec<RangeFragIx, RangeFrag>) {
-        self.0.sort_unstable_by(|fix_a, fix_b| {
+        &mut self.0[..].sort_unstable_by(|fix_a, fix_b| {
             match cmp_range_frags(&fenv[*fix_a], &fenv[*fix_b]) {
                 Some(Ordering::Less) => Ordering::Less,
                 Some(Ordering::Greater) => Ordering::Greater,
@@ -1800,7 +1800,7 @@ impl SortedRangeFragIxs {
     }
 
     pub(crate) fn new(
-        frag_ixs: SmallVec<[RangeFragIx; 4]>,
+        frag_ixs: BumpSmallVec<'a, [RangeFragIx; 4]>,
         fenv: &TypedIxVec<RangeFragIx, RangeFrag>,
     ) -> Self {
         let mut res = Self(frag_ixs);
@@ -1810,8 +1810,12 @@ impl SortedRangeFragIxs {
         res
     }
 
-    pub(crate) fn unit(fix: RangeFragIx, fenv: &TypedIxVec<RangeFragIx, RangeFrag>) -> Self {
-        let mut res = Self(SmallVec::<[RangeFragIx; 4]>::new());
+    pub(crate) fn unit(
+        fix: RangeFragIx,
+        fenv: &TypedIxVec<RangeFragIx, RangeFrag>,
+        alloc: &Alloc<'a>,
+    ) -> Self {
+        let mut res = Self(BumpSmallVec::new(alloc));
         res.0.push(fix);
         res.check(fenv);
         res
@@ -1823,7 +1827,7 @@ impl SortedRangeFragIxs {
         fenv: &TypedIxVec<RangeFragIx, RangeFrag>,
         pt: InstPoint,
     ) -> bool {
-        self.0
+        self.0[..]
             .binary_search_by(|&ix| {
                 let frag = &fenv[ix];
                 if pt < frag.first {
@@ -1841,38 +1845,38 @@ impl SortedRangeFragIxs {
 /// Vectors of RangeFrags, sorted so that they are in ascending order, per
 /// their InstPoint fields.  The RangeFrags may not overlap.
 #[derive(Clone)]
-pub(crate) struct SortedRangeFrags(SmallVec<[RangeFrag; 4]>);
+pub(crate) struct SortedRangeFrags<'a>(BumpSmallVec<'a, [RangeFrag; 4]>);
 
-impl fmt::Debug for SortedRangeFrags {
+impl<'a> fmt::Debug for SortedRangeFrags<'a> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         self.0.fmt(fmt)
     }
 }
 
-impl Deref for SortedRangeFrags {
-    type Target = SmallVec<[RangeFrag; 4]>;
+impl<'a> Deref for SortedRangeFrags<'a> {
+    type Target = BumpSmallVec<'a, [RangeFrag; 4]>;
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl DerefMut for SortedRangeFrags {
+impl<'a> DerefMut for SortedRangeFrags<'a> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-impl SortedRangeFrags {
-    pub(crate) fn unit(frag: RangeFrag) -> Self {
-        let mut res = Self(SmallVec::<[RangeFrag; 4]>::new());
+impl<'a> SortedRangeFrags<'a> {
+    pub(crate) fn unit(frag: RangeFrag, alloc: &Alloc<'a>) -> Self {
+        let mut res = Self(BumpSmallVec::new(alloc));
         res.0.push(frag);
         res
     }
 
-    pub(crate) fn empty() -> Self {
-        Self(SmallVec::<[RangeFrag; 4]>::new())
+    pub(crate) fn empty(alloc: &Alloc<'a>) -> Self {
+        Self(BumpSmallVec::new(alloc))
     }
 
     pub(crate) fn overlaps(&self, other: &Self) -> bool {
@@ -1907,7 +1911,7 @@ impl SortedRangeFrags {
 
     /// Does this sorted list of range fragments contain the given instruction point?
     pub(crate) fn contains_pt(&self, pt: InstPoint) -> bool {
-        self.0
+        self.0[..]
             .binary_search_by(|frag| {
                 if pt < frag.first {
                     Ordering::Greater
@@ -2057,13 +2061,13 @@ impl SpillCost {
 // no longer work.
 
 #[derive(Clone)]
-pub struct RealRange {
+pub struct RealRange<'a> {
     pub rreg: RealReg,
-    pub(crate) sorted_frags: SortedRangeFragIxs,
+    pub(crate) sorted_frags: SortedRangeFragIxs<'a>,
     pub is_ref: bool,
 }
 
-impl fmt::Debug for RealRange {
+impl<'a> fmt::Debug for RealRange<'a> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(
             fmt,
@@ -2075,7 +2079,7 @@ impl fmt::Debug for RealRange {
     }
 }
 
-impl RealRange {
+impl<'a> RealRange<'a> {
     pub fn show_with_rru(&self, univ: &RealRegUniverse) -> String {
         format!(
             "(RR: {}{}, {:?})",
@@ -2093,23 +2097,23 @@ impl RealRange {
 // some later point.)
 
 #[derive(Clone)]
-pub struct VirtualRange {
+pub struct VirtualRange<'a> {
     pub(crate) vreg: VirtualReg,
     pub(crate) rreg: Option<RealReg>,
-    pub(crate) sorted_frags: SortedRangeFrags,
+    pub(crate) sorted_frags: SortedRangeFrags<'a>,
     pub(crate) is_ref: bool,
     pub(crate) size: u16,
     pub(crate) total_cost: u32,
     pub(crate) spill_cost: SpillCost, // == total_cost / size
 }
 
-impl VirtualRange {
+impl<'a> VirtualRange<'a> {
     pub fn overlaps(&self, other: &Self) -> bool {
         self.sorted_frags.overlaps(&other.sorted_frags)
     }
 }
 
-impl fmt::Debug for VirtualRange {
+impl<'a> fmt::Debug for VirtualRange<'a> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(
             fmt,
@@ -2134,21 +2138,17 @@ impl fmt::Debug for VirtualRange {
 /// Mappings from RealRegs and VirtualRegs to the sets of RealRanges and VirtualRanges that belong
 /// to them.  These are needed for BT's coalescing analysis and for the dataflow analysis that
 /// supports reftype handling.
-pub(crate) struct RegToRangesMaps {
+pub(crate) struct RegToRangesMaps<'a> {
     /// This maps RealReg indices to the set of RealRangeIxs for that RealReg. Valid indices are
     /// real register indices for all non-sanitised real regs; that is,
     /// 0..RealRegUniverse::allocable. The Vecs of RealRangeIxs are duplicate-free.
-    ///
-    /// The SmallVec capacity of 6 was chosen after quite some profiling, of Cranelift/x64/newBE
-    /// compiling ZenGarden.wasm -- a huge input, with many relatively small functions. Profiling
-    /// was performed in August 2020, using Valgrind/DHAT.
-    pub(crate) rreg_to_rlrs_map: Vec</*real reg ix, */ SmallVec<[RealRangeIx; 6]>>,
+    pub(crate) rreg_to_rlrs_map:
+        BumpVec<'a, /*real reg ix, */ BumpSmallVec<'a, [RealRangeIx; 6]>>,
 
     /// This maps VirtualReg indices to the set of VirtualRangeIxs for that VirtualReg. Valid
-    /// indices are 0..Function::get_num_vregs(). For functions mostly translated from SSA,
-    /// most VirtualRegs will have just one VirtualRange, and there are a lot of VirtualRegs in
-    /// general. So SmallVec is a definite benefit here.
-    pub(crate) vreg_to_vlrs_map: Vec</*virtual reg ix, */ SmallVec<[VirtualRangeIx; 3]>>,
+    /// indices are 0..Function::get_num_vregs().
+    pub(crate) vreg_to_vlrs_map:
+        BumpVec<'a, /*virtual reg ix, */ BumpSmallVec<'a, [VirtualRangeIx; 6]>>,
 
     /// As an optimisation heuristic for BT's coalescing analysis, these indicate which
     /// real/virtual registers have "many" `RangeFrag`s in their live ranges. For some definition
@@ -2158,9 +2158,9 @@ pub(crate) struct RegToRangesMaps {
     /// vast majority) and the other of which has better asymptotic behaviour for regs with many
     /// `RangeFrag`s (in order to keep out of trouble on some pathological inputs).  These vectors
     /// are duplicate-free but the elements may be in an arbitrary order.
-    pub(crate) rregs_with_many_frags: Vec<u32 /*RealReg index*/>,
+    pub(crate) rregs_with_many_frags: BumpVec<'a, u32 /*RealReg index*/>,
     /// Same as above, for virtual registers.
-    pub(crate) vregs_with_many_frags: Vec<u32 /*VirtualReg index*/>,
+    pub(crate) vregs_with_many_frags: BumpVec<'a, u32 /*VirtualReg index*/>,
 
     /// This indicates what the threshold is actually set to.  A frag will be in
     /// `{r,v}regs_with_many_frags` if it has `many_frags_thresh` or more RangeFrags.
@@ -2179,16 +2179,16 @@ pub(crate) struct MoveInfoElem {
 
 /// Vector of `MoveInfoElem`, presented in no particular order, but duplicate-free in that each
 /// move instruction will be listed only once.
-pub(crate) struct MoveInfo(Vec<MoveInfoElem>);
+pub(crate) struct MoveInfo<'a>(BumpVec<'a, MoveInfoElem>);
 
-impl MoveInfo {
-    pub(crate) fn new(move_info: Vec<MoveInfoElem>) -> Self {
+impl<'a> MoveInfo<'a> {
+    pub(crate) fn new(move_info: BumpVec<'a, MoveInfoElem>) -> Self {
         Self(move_info)
     }
 }
 
-impl Deref for MoveInfo {
-    type Target = Vec<MoveInfoElem>;
+impl<'a> Deref for MoveInfo<'a> {
+    type Target = BumpVec<'a, MoveInfoElem>;
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
         &self.0

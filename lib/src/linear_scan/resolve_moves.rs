@@ -6,32 +6,32 @@ use crate::{
     sparse_set::SparseSet,
     Function, RealReg, Reg, SpillSlot, TypedIxVec, VirtualReg, Writable,
 };
+use crate::{Alloc, BumpSmallVec, BumpVec};
 
 use log::{debug, info, trace};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use smallvec::SmallVec;
 use std::fmt;
 
-fn resolve_moves_in_block<F: Function>(
+fn resolve_moves_in_block<'a, F: Function>(
     func: &F,
-    intervals: &Vec<VirtualInterval>,
-    reg_uses: &RegUses,
+    intervals: &[VirtualInterval],
+    reg_uses: &RegUses<'a>,
     scratches_by_rc: &[Option<RealReg>],
     spill_slot: &mut u32,
-    moves_in_blocks: &mut Vec<InstToInsertAndExtPoint>,
-    tmp_ordered_moves: &mut Vec<MoveOp>,
-    tmp_stack: &mut Vec<MoveOp>,
+    moves_in_blocks: &mut BumpVec<'a, InstToInsertAndExtPoint>,
+    tmp_ordered_moves: &mut BumpVec<'a, MoveOp>,
+    tmp_stack: &mut BumpVec<'a, MoveOp>,
+    alloc: &Alloc<'a>,
 ) {
-    let mut block_ends = HashSet::default();
-    let mut block_starts = HashSet::default();
+    let mut block_ends = alloc.set(4);
+    let mut block_starts = alloc.set(4);
     for bix in func.blocks() {
         let insts = func.block_insns(bix);
         block_ends.insert(insts.last());
         block_starts.insert(insts.first());
     }
 
-    let mut reloads_at_inst = HashMap::default();
-    let mut spills_at_inst = Vec::new();
+    let mut reloads_at_inst = alloc.map(4);
+    let mut spills_at_inst = alloc.vec(0);
 
     for interval in intervals {
         let parent_id = match interval.parent {
@@ -89,7 +89,9 @@ fn resolve_moves_in_block<F: Function>(
                     _ => unreachable!(),
                 }
 
-                let entry = reloads_at_inst.entry(at_inst).or_insert_with(|| Vec::new());
+                let entry = reloads_at_inst
+                    .entry(at_inst)
+                    .or_insert_with(|| alloc.vec(0));
 
                 match parent.location {
                     Location::None => unreachable!(),
@@ -160,7 +162,7 @@ fn resolve_moves_in_block<F: Function>(
         schedule_moves(&mut pending_moves, tmp_ordered_moves, tmp_stack);
         emit_moves(
             at_inst,
-            &tmp_ordered_moves,
+            &tmp_ordered_moves[..],
             spill_slot,
             scratches_by_rc,
             moves_in_blocks,
@@ -170,15 +172,15 @@ fn resolve_moves_in_block<F: Function>(
     moves_in_blocks.append(&mut spills_at_inst);
 }
 
-#[derive(Default, Clone)]
-struct BlockInfo {
-    start: SmallVec<[(VirtualReg, IntId); 4]>,
-    end: SmallVec<[(VirtualReg, IntId); 4]>,
+#[derive(Clone)]
+struct BlockInfo<'a> {
+    start: BumpSmallVec<'a, [(VirtualReg, IntId); 4]>,
+    end: BumpSmallVec<'a, [(VirtualReg, IntId); 4]>,
 }
 
 static UNSORTED_THRESHOLD: usize = 8;
 
-impl BlockInfo {
+impl<'a> BlockInfo<'a> {
     #[inline(never)]
     fn insert(&mut self, pos: BlockPos, vreg: VirtualReg, id: IntId) {
         match pos {
@@ -198,10 +200,10 @@ impl BlockInfo {
     #[inline(never)]
     fn finish(&mut self) {
         if self.start.len() >= UNSORTED_THRESHOLD {
-            self.start.sort_unstable_by_key(|pair| pair.0);
+            self.start[..].sort_unstable_by_key(|pair| pair.0);
         }
         if self.end.len() >= UNSORTED_THRESHOLD {
-            self.end.sort_unstable_by_key(|pair| pair.0);
+            self.end[..].sort_unstable_by_key(|pair| pair.0);
         }
     }
 
@@ -212,7 +214,7 @@ impl BlockInfo {
             BlockPos::End => &self.end,
         };
         if array.len() >= UNSORTED_THRESHOLD {
-            array[array.binary_search_by_key(vreg, |pair| pair.0).unwrap()].1
+            array[array[..].binary_search_by_key(vreg, |pair| pair.0).unwrap()].1
         } else {
             array
                 .iter()
@@ -226,18 +228,19 @@ impl BlockInfo {
 /// For each block, collect a mapping of block_{start, end} -> actual location, to make the
 /// across-blocks fixup phase fast.
 #[inline(never)]
-fn collect_block_infos<F: Function>(
+fn collect_block_infos<'a, F: Function>(
     func: &F,
-    intervals: &Vec<VirtualInterval>,
-    liveins: &TypedIxVec<BlockIx, SparseSet<Reg>>,
-    liveouts: &TypedIxVec<BlockIx, SparseSet<Reg>>,
-) -> Vec<BlockInfo> {
+    intervals: &[VirtualInterval],
+    liveins: &TypedIxVec<'a, BlockIx, SparseSet<Reg>>,
+    liveouts: &TypedIxVec<'a, BlockIx, SparseSet<Reg>>,
+    alloc: &Alloc<'a>,
+) -> BumpVec<'a, BlockInfo<'a>> {
     // Preallocate the block information, with the final size of each vector.
-    let mut infos = Vec::with_capacity(func.blocks().len());
+    let mut infos = alloc.vec(func.blocks().len());
     for bix in func.blocks() {
         infos.push(BlockInfo {
-            start: SmallVec::with_capacity(liveins[bix].card()),
-            end: SmallVec::with_capacity(liveouts[bix].card()),
+            start: BumpSmallVec::with_capacity(liveins[bix].card(), alloc),
+            end: BumpSmallVec::with_capacity(liveouts[bix].card(), alloc),
         });
     }
 
@@ -286,24 +289,25 @@ fn collect_block_infos<F: Function>(
 /// - resolve cycles in the pending moves
 /// - generate real moves from the pending moves.
 #[inline(never)]
-fn resolve_moves_across_blocks<F: Function>(
+fn resolve_moves_across_blocks<'a, F: Function>(
     func: &F,
-    cfg: &CFGInfo,
-    liveins: &TypedIxVec<BlockIx, SparseSet<Reg>>,
-    liveouts: &TypedIxVec<BlockIx, SparseSet<Reg>>,
-    intervals: &Vec<VirtualInterval>,
+    cfg: &CFGInfo<'a>,
+    liveins: &TypedIxVec<'a, BlockIx, SparseSet<Reg>>,
+    liveouts: &TypedIxVec<'a, BlockIx, SparseSet<Reg>>,
+    intervals: &[VirtualInterval],
     scratches_by_rc: &[Option<RealReg>],
     spill_slot: &mut u32,
-    moves_at_block_starts: &mut Vec<InstToInsertAndExtPoint>,
-    moves_at_block_ends: &mut Vec<InstToInsertAndExtPoint>,
-    tmp_ordered_moves: &mut Vec<MoveOp>,
-    tmp_stack: &mut Vec<MoveOp>,
+    moves_at_block_starts: &mut BumpVec<'a, InstToInsertAndExtPoint>,
+    moves_at_block_ends: &mut BumpVec<'a, InstToInsertAndExtPoint>,
+    tmp_ordered_moves: &mut BumpVec<'a, MoveOp>,
+    tmp_stack: &mut BumpVec<'a, MoveOp>,
+    alloc: &Alloc<'a>,
 ) {
-    let mut parallel_move_map = HashMap::default();
+    let mut parallel_move_map = alloc.map(4);
 
-    let block_info = collect_block_infos(func, intervals, liveins, liveouts);
+    let block_info = collect_block_infos(func, intervals, liveins, liveouts, alloc);
 
-    let mut seen_successors = HashSet::default();
+    let mut seen_successors = alloc.set(4);
     for block in func.blocks() {
         let successors = &cfg.succ_map[block];
 
@@ -365,7 +369,7 @@ fn resolve_moves_across_blocks<F: Function>(
 
                 let pending_moves = parallel_move_map
                     .entry(at_inst)
-                    .or_insert_with(|| (Vec::new(), block_pos));
+                    .or_insert_with(|| (alloc.vec(0), block_pos));
 
                 match (loc_at_cur_end, loc_at_succ_start) {
                     (Location::Reg(cur_rreg), Location::Reg(succ_rreg)) => {
@@ -442,7 +446,7 @@ fn resolve_moves_across_blocks<F: Function>(
                 BlockPos::Start => {
                     emit_moves(
                         *at_inst,
-                        &tmp_ordered_moves,
+                        &tmp_ordered_moves[..],
                         spill_slot,
                         scratches_by_rc,
                         moves_at_block_starts,
@@ -451,7 +455,7 @@ fn resolve_moves_across_blocks<F: Function>(
                 BlockPos::End => {
                     emit_moves(
                         *at_inst,
-                        &tmp_ordered_moves,
+                        &tmp_ordered_moves[..],
                         spill_slot,
                         scratches_by_rc,
                         moves_at_block_ends,
@@ -467,16 +471,17 @@ fn resolve_moves_across_blocks<F: Function>(
 }
 
 #[inline(never)]
-pub(crate) fn run<F: Function>(
+pub(crate) fn run<'a, F: Function>(
     func: &F,
-    cfg: &CFGInfo,
-    reg_uses: &RegUses,
-    intervals: &Vec<VirtualInterval>,
-    liveins: &TypedIxVec<BlockIx, SparseSet<Reg>>,
-    liveouts: &TypedIxVec<BlockIx, SparseSet<Reg>>,
+    cfg: &CFGInfo<'a>,
+    reg_uses: &RegUses<'a>,
+    intervals: &[VirtualInterval],
+    liveins: &TypedIxVec<'a, BlockIx, SparseSet<Reg>>,
+    liveouts: &TypedIxVec<'a, BlockIx, SparseSet<Reg>>,
     spill_slot: &mut u32,
     scratches_by_rc: &[Option<RealReg>],
-) -> Vec<InstToInsertAndExtPoint> {
+    alloc: &Alloc<'a>,
+) -> BumpVec<'a, InstToInsertAndExtPoint> {
     info!("resolve_moves");
 
     // Keep three lists of moves to insert:
@@ -487,12 +492,12 @@ pub(crate) fn run<F: Function>(
     // To maintain the property that these moves are eventually sorted at the end, we'll compute
     // the final array of moves by concatenating these three arrays. `inst_stream` uses a stable
     // sort, making sure the at-block-start/within-block/at-block-end will be respected.
-    let mut moves_at_block_starts = Vec::new();
-    let mut moves_at_block_ends = Vec::new();
-    let mut moves_in_blocks = Vec::new();
+    let mut moves_at_block_starts = alloc.vec(16);
+    let mut moves_at_block_ends = alloc.vec(16);
+    let mut moves_in_blocks = alloc.vec(16);
 
-    let mut tmp_stack = Vec::new();
-    let mut tmp_ordered_moves = Vec::new();
+    let mut tmp_stack = alloc.vec(16);
+    let mut tmp_ordered_moves = alloc.vec(16);
     resolve_moves_in_block(
         func,
         intervals,
@@ -502,6 +507,7 @@ pub(crate) fn run<F: Function>(
         &mut moves_in_blocks,
         &mut tmp_ordered_moves,
         &mut tmp_stack,
+        alloc,
     );
 
     resolve_moves_across_blocks(
@@ -516,6 +522,7 @@ pub(crate) fn run<F: Function>(
         &mut moves_at_block_ends,
         &mut tmp_ordered_moves,
         &mut tmp_stack,
+        alloc,
     );
 
     let mut insts_and_points = moves_at_block_starts;
@@ -616,8 +623,8 @@ impl MoveOp {
     }
 }
 
-fn find_blocking_move<'a>(
-    pending: &'a mut Vec<MoveOp>,
+fn find_blocking_move<'a, 'arena>(
+    pending: &'a mut BumpVec<'arena, MoveOp>,
     last: &MoveOp,
 ) -> Option<(usize, &'a mut MoveOp)> {
     for (i, other) in pending.iter_mut().enumerate() {
@@ -628,8 +635,8 @@ fn find_blocking_move<'a>(
     None
 }
 
-fn find_cycled_move<'a>(
-    stack: &'a mut Vec<MoveOp>,
+fn find_cycled_move<'a, 'arena>(
+    stack: &'a mut BumpVec<'arena, MoveOp>,
     from: &mut usize,
     last: &MoveOp,
 ) -> Option<&'a mut MoveOp> {
@@ -646,10 +653,10 @@ fn find_cycled_move<'a>(
 /// Given a pending list of moves, returns a list of moves ordered in a correct
 /// way, i.e., no move clobbers another one.
 #[inline(never)]
-fn schedule_moves(
-    pending: &mut Vec<MoveOp>,
-    ordered_moves: &mut Vec<MoveOp>,
-    stack: &mut Vec<MoveOp>,
+fn schedule_moves<'a>(
+    pending: &mut BumpVec<'a, MoveOp>,
+    ordered_moves: &mut BumpVec<'a, MoveOp>,
+    stack: &mut BumpVec<'a, MoveOp>,
 ) {
     ordered_moves.clear();
 
@@ -721,12 +728,12 @@ fn schedule_moves(
 }
 
 #[inline(never)]
-fn emit_moves(
+fn emit_moves<'a>(
     at_inst: InstPoint,
-    ordered_moves: &Vec<MoveOp>,
+    ordered_moves: &[MoveOp],
     num_spill_slots: &mut u32,
     scratches_by_rc: &[Option<RealReg>],
-    moves_in_blocks: &mut Vec<InstToInsertAndExtPoint>,
+    moves_in_blocks: &mut BumpVec<'a, InstToInsertAndExtPoint>,
 ) {
     let mut spill_slot = None;
     let mut in_cycle = false;

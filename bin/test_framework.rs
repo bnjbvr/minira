@@ -1284,8 +1284,9 @@ impl<'a> IState<'a> {
                 .entry
                 .as_ref()
                 .expect("missing entry block")
-                .get_block_ix()]
-            .start,
+                .get_block_ix()
+                .get() as usize]
+                .start,
             vregs: Vec::new(),
             rregs: Vec::new(),
             mem: Vec::new(),
@@ -1480,7 +1481,7 @@ impl<'a> IState<'a> {
         self.nia = iix.plus(1);
         self.num_insts += 1;
 
-        let insn = &self.func.insns[iix];
+        let insn = &self.func.insns[iix.get() as usize];
         match insn {
             Inst::NopZ {} => {
                 self.num_insts -= 1;
@@ -1570,7 +1571,9 @@ impl<'a> IState<'a> {
                 self.set_reg_f32(dst.to_reg(), src_v);
                 self.num_reloads += 1;
             }
-            Inst::Goto { target } => self.nia = self.func.blocks[target.get_block_ix()].start,
+            Inst::Goto { target } => {
+                self.nia = self.func.blocks[target.get_block_ix().get() as usize].start
+            }
             Inst::GotoCTF {
                 cond,
                 target_true,
@@ -1581,7 +1584,7 @@ impl<'a> IState<'a> {
                 } else {
                     target_false
                 };
-                self.nia = self.func.blocks[target.get_block_ix()].start;
+                self.nia = self.func.blocks[target.get_block_ix().get() as usize].start;
             }
             Inst::PrintS { str } => {
                 self.stdout += str;
@@ -1705,17 +1708,17 @@ pub struct Func {
     pub entry: Option<Label>,
     pub num_virtual_regs: u32,
     pub reftype_reg_start: Option<u32>, // all vregs >= this index are reftyped.
-    pub insns: TypedIxVec<InstIx, Inst>, // indexed by InstIx
+    pub insns: Vec<Inst>,               // indexed by InstIx
 
     // Note that `blocks` must be in order of increasing `Block::start`
     // fields.  Code that wants to traverse the blocks in some other order
     // must represent the ordering some other way; rearranging Func::blocks is
     // not allowed.
-    pub blocks: TypedIxVec<BlockIx, Block>, // indexed by BlockIx
+    pub blocks: Vec<Block>, // indexed by BlockIx
 }
 
 // Find a block Ix for a block name
-fn lookup(blocks: &TypedIxVec<BlockIx, Block>, name: String) -> BlockIx {
+fn lookup<'a>(blocks: &Vec<Block>, name: String) -> BlockIx {
     let mut bix = 0;
     for b in blocks.iter() {
         if b.name == name {
@@ -1727,14 +1730,14 @@ fn lookup(blocks: &TypedIxVec<BlockIx, Block>, name: String) -> BlockIx {
 }
 
 impl Func {
-    pub fn new<'a>(name: &'a str) -> Self {
+    pub fn new(name: &str) -> Self {
         Func {
             name: name.to_string(),
             entry: None,
             num_virtual_regs: 0,
             reftype_reg_start: None,
-            insns: TypedIxVec::<InstIx, Inst>::new(),
-            blocks: TypedIxVec::<BlockIx, Block>::new(),
+            insns: vec![],
+            blocks: vec![],
         }
     }
 
@@ -1744,7 +1747,7 @@ impl Func {
         });
     }
 
-    pub fn print(&self, who: &str, mb_block_anns: &Option<TypedIxVec<BlockIx, Vec<String>>>) {
+    pub fn print(&self, who: &str, mb_block_anns: &Option<Vec<Vec<String>>>) {
         println!("");
         println!(
             "Func {}: name='{}' entry='{:?}' {{",
@@ -1758,14 +1761,14 @@ impl Func {
             println!("  {:?}:{}", BlockIx::new(ix), b.name);
 
             if let Some(anns_map) = mb_block_anns {
-                for ann in &anns_map[BlockIx::new(ix)] {
+                for ann in &anns_map[ix as usize] {
                     println!("      ;; {}", ann);
                 }
             }
 
             for i in b.start.get()..b.start.get() + b.len {
                 let ix = InstIx::new(i);
-                println!("      {:<3?}   {:?}", ix, self.insns[ix]);
+                println!("      {:<3?}   {:?}", ix, self.insns[ix.get() as usize]);
             }
             ix += 1;
         }
@@ -1792,7 +1795,7 @@ impl Func {
                 let mut ru_vecs = RegUsageCollector::get_empty_reg_vecs_test_framework_only(false);
                 let mut ru_collector = RegUsageCollector::new(&mut ru_vecs);
 
-                self.insns[iix].get_reg_usage(&mut ru_collector);
+                self.insns[iix.get() as usize].get_reg_usage(&mut ru_collector);
                 assert!(!ru_collector.reg_vecs.is_sanitized());
 
                 let (used_vec, defined_vec, modified_vec) =
@@ -1849,7 +1852,7 @@ impl Func {
             writeln!(fmt, "{:?}:", BlockIx::new(ix))?;
             for i in b.start.get()..b.start.get() + b.len {
                 let ix = InstIx::new(i);
-                writeln!(fmt, "    {:?}", self.insns[ix])?;
+                writeln!(fmt, "    {:?}", self.insns[ix.get() as usize])?;
             }
             ix += 1;
         }
@@ -1866,12 +1869,11 @@ impl Func {
     }
 
     // Add a block to the Func
-    pub fn block<'a>(&mut self, name: &'a str, insns: Vec<Inst>) {
-        let mut insns = TypedIxVec::from_vec(insns);
+    pub fn block(&mut self, name: &str, insns: Vec<Inst>) {
         let start = self.insns.len();
         let len = insns.len() as u32;
-        self.insns.append(&mut insns);
-        let b = Block::new(name.to_string(), InstIx::new(start), len);
+        self.insns.extend(insns.into_iter());
+        let b = Block::new(name.to_string(), InstIx::new(start as u32), len);
         self.blocks.push(b);
     }
 
@@ -1885,20 +1887,23 @@ impl Func {
           - convert references to block numbers
     */
     pub fn finish(&mut self) {
-        for bix in BlockIx::new(0).dotdot(BlockIx::new(self.blocks.len())) {
-            let b = &self.blocks[bix];
+        for bix in BlockIx::new(0).dotdot(BlockIx::new(self.blocks.len() as u32)) {
+            let b = &self.blocks[bix.get() as usize];
             if b.len == 0 {
                 panic!("Func::done: a block is empty");
             }
-            if bix > BlockIx::new(0) && self.blocks[bix.minus(1)].start >= self.blocks[bix].start {
+            if bix > BlockIx::new(0)
+                && self.blocks[bix.minus(1).get() as usize].start
+                    >= self.blocks[bix.get() as usize].start
+            {
                 panic!("Func: blocks are not in increasing order of InstIx");
             }
             for i in 0..b.len {
                 let iix = b.start.plus(i);
-                if i == b.len - 1 && !self.insns[iix].is_control_flow() {
+                if i == b.len - 1 && !self.insns[iix.get() as usize].is_control_flow() {
                     panic!("Func: block must end in control flow insn");
                 }
-                if i != b.len - 1 && self.insns[iix].is_control_flow() {
+                if i != b.len - 1 && self.insns[iix.get() as usize].is_control_flow() {
                     panic!("Func: block contains control flow insn not at end");
                 }
             }
@@ -1913,16 +1918,16 @@ impl Func {
     }
 
     pub fn update_from_alloc(&mut self, result: regalloc::RegAllocResult<Func>) {
-        self.insns = TypedIxVec::from_vec(result.insns);
+        self.insns = result.insns.into_iter().collect();
         let num_blocks = self.blocks.len();
         let mut i = 0;
-        for bix in self.blocks.range() {
+        for bix in 0..self.blocks.len() {
             let block = &mut self.blocks[bix];
-            block.start = result.target_map[bix];
+            block.start = result.target_map[BlockIx::new(bix as u32)];
             block.len = if i + 1 < num_blocks {
-                result.target_map[BlockIx::new(i + 1)].get()
+                result.target_map[BlockIx::new((i + 1) as u32)].get()
             } else {
-                self.insns.len()
+                self.insns.len() as u32
             } - block.start.get();
             i += 1;
         }
@@ -1937,10 +1942,10 @@ impl Func {
                     .map(|index| Reg::new_virtual(RegClass::I32, index).to_virtual_reg())
                     .collect::<Vec<_>>();
                 let mut safepoint_insns = vec![];
-                for iix in self.insns.range() {
+                for iix in 0..self.insns.len() {
                     match self.insns[iix] {
                         Inst::Safepoint => {
-                            safepoint_insns.push(iix);
+                            safepoint_insns.push(InstIx::new(iix as u32));
                         }
                         _ => {}
                     }
@@ -1991,6 +1996,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub enum Stmt {
     Vanilla {
         insn: Inst,
@@ -2137,7 +2143,7 @@ fn make_text_label_str(n: usize) -> String {
 }
 
 impl Blockifier {
-    pub fn new<'a>(name: &'a str) -> Self {
+    pub fn new<'b>(name: &str) -> Self {
         Self {
             name: name.to_string(),
             blocks: vec![],
@@ -2157,7 +2163,7 @@ impl Blockifier {
     fn blockify(&mut self, stmts: Vec<Stmt>) -> (usize, usize) {
         let entry_block = self.blocks.len();
         let mut cur_block = entry_block;
-        self.blocks.push(Vec::new());
+        self.blocks.push(vec![]);
         for s in stmts {
             match s {
                 Stmt::Vanilla { insn } => {
@@ -2171,7 +2177,7 @@ impl Blockifier {
                     let (t_ent, t_exit) = self.blockify(stmts_t);
                     let (e_ent, e_exit) = self.blockify(stmts_e);
                     let cont = self.blocks.len();
-                    self.blocks.push(Vec::new());
+                    self.blocks.push(vec![]);
                     self.blocks[t_exit].push(i_goto(&make_text_label_str(cont)));
                     self.blocks[e_exit].push(i_goto(&make_text_label_str(cont)));
                     self.blocks[cur_block].push(i_goto_ctf(
@@ -2201,7 +2207,7 @@ impl Blockifier {
                         .push(vec![i_goto(&make_text_label_str(loop_header))]);
 
                     let after_loop = self.blocks.len();
-                    self.blocks.push(Vec::new());
+                    self.blocks.push(vec![]);
 
                     self.blocks[s_exit].push(i_goto_ctf(
                         cond,
@@ -2213,12 +2219,12 @@ impl Blockifier {
                 }
                 Stmt::WhileDo { cond, stmts } => {
                     let condblock = self.blocks.len();
-                    self.blocks.push(Vec::new());
+                    self.blocks.push(vec![]);
                     self.blocks[cur_block].push(i_goto(&make_text_label_str(condblock)));
                     let (s_ent, s_exit) = self.blockify(stmts);
                     self.blocks[s_exit].push(i_goto(&make_text_label_str(condblock)));
                     let cont = self.blocks.len();
-                    self.blocks.push(Vec::new());
+                    self.blocks.push(vec![]);
                     self.blocks[condblock].push(i_goto_ctf(
                         cond,
                         &make_text_label_str(s_ent),
@@ -2258,19 +2264,19 @@ impl regalloc::Function for Func {
     type Inst = Inst;
 
     fn insns(&self) -> &[Inst] {
-        self.insns.elems()
+        &self.insns[..]
     }
 
     fn insns_mut(&mut self) -> &mut [Inst] {
-        self.insns.elems_mut()
+        &mut self.insns[..]
     }
 
     fn get_insn(&self, iix: InstIx) -> &Inst {
-        &self.insns[iix]
+        &self.insns[iix.get() as usize]
     }
 
     fn get_insn_mut(&mut self, iix: InstIx) -> &mut Inst {
-        &mut self.insns[iix]
+        &mut self.insns[iix.get() as usize]
     }
 
     fn entry_block(&self) -> BlockIx {
@@ -2278,22 +2284,27 @@ impl regalloc::Function for Func {
     }
 
     fn blocks(&self) -> Range<BlockIx> {
-        self.blocks.range()
+        Range::new(BlockIx::new(0), self.blocks.len())
     }
 
     /// Provide the range of instruction indices contained in each block.
     fn block_insns(&self, block: BlockIx) -> Range<InstIx> {
-        Range::new(self.blocks[block].start, self.blocks[block].len as usize)
+        Range::new(
+            self.blocks[block.get() as usize].start,
+            self.blocks[block.get() as usize].len as usize,
+        )
     }
 
     /// Get CFG successors: indexed by block, provide a list of successor blocks.
     fn block_succs(&self, block: BlockIx) -> Cow<[BlockIx]> {
-        let last_insn = self.blocks[block].start.plus(self.blocks[block].len - 1);
-        Cow::Owned(self.insns[last_insn].get_targets())
+        let last_insn = self.blocks[block.get() as usize]
+            .start
+            .plus(self.blocks[block.get() as usize].len - 1);
+        Cow::Owned(self.insns[last_insn.get() as usize].get_targets())
     }
 
     fn is_ret(&self, insn: InstIx) -> bool {
-        match &self.insns[insn] {
+        match &self.insns[insn.get() as usize] {
             &Inst::Finish { .. } => true,
             _ => false,
         }

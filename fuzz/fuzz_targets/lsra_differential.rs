@@ -26,11 +26,14 @@ fuzz_target!(|func: ir::Func| {
     func.render("before allocation", &mut rendered).unwrap();
     println!("{}", rendered);
 
+    let bump = regalloc::Bump::new();
+    let alloc = regalloc::Alloc(&bump);
     let result = match regalloc::allocate_registers(
         &mut func,
         &reg_universe,
         None,
         regalloc::AlgorithmWithDefaults::LinearScan,
+        &alloc,
     ) {
         Ok(result) => result,
         Err(err) => {

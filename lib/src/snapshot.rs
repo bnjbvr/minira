@@ -157,12 +157,17 @@ impl IRSnapshot {
         }
     }
 
-    pub fn allocate(&mut self, opts: Options) -> Result<RegAllocResult<IRFunction>, RegAllocError> {
+    pub fn allocate<'a>(
+        &mut self,
+        opts: Options,
+        alloc: &Alloc<'a>,
+    ) -> Result<RegAllocResult<'a, IRFunction>, RegAllocError> {
         allocate_registers_with_opts(
             &mut self.func,
             &self.reg_universe,
             None, /*no stackmap request*/
             opts,
+            alloc,
         )
     }
 }

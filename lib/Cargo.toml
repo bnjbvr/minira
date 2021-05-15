@@ -13,6 +13,8 @@ rustc-hash = "1.0.1"
 log = { version = "0.4.8", default-features = false }
 smallvec = "1.6.1"
 serde = { version = "1.0.94", features = ["derive"], optional = true }
+bumpalo = { version = "3.4.0", features = ["collections"] }
+hashbrown = { version = "0.10.0", features = ["raw"] }
 
 [features]
 default = []

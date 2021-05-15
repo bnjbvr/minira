@@ -4,16 +4,17 @@
 //! An implementation of sets which aims to be fast for both large sets and
 //! very small sets, even if the elements are sparse relative to the universe.
 
-use rustc_hash::FxHashSet;
 use std::fmt;
 use std::hash::Hash;
+
+use crate::{Alloc, BumpSet};
 
 //=============================================================================
 // SparseSet
 
 // Handy wrappers around `SparseSetU`, if you don't want to have to guess at an "optimal"
 // in-line size.
-pub type SparseSet<T> = SparseSetU<[T; 12]>;
+pub type SparseSet<'a, T> = SparseSetU<'a, [T; 12]>;
 //pub type SparseSetIter<'a, T> = SparseSetUIter<'a, [T; 12]>; // No use case yet
 
 // Implementation: for small, unordered but no dups
@@ -43,14 +44,21 @@ impl_array!(2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 20, 24, 28, 32);
 // The U here stands for "unordered".  It refers to the fact that the elements
 // in `Small::arr` are in no particular order, although they are
 // duplicate-free.
-pub enum SparseSetU<A: Array> {
-    Large { set: FxHashSet<A::Item> },
-    Small { card: usize, arr: MaybeUninit<A> },
+pub enum SparseSetU<'a, A: Array> {
+    Large {
+        set: BumpSet<'a, A::Item>,
+        alloc: Alloc<'a>,
+    },
+    Small {
+        card: usize,
+        arr: MaybeUninit<A>,
+        alloc: Alloc<'a>,
+    },
 }
 
 // ================ Admin (private) methods ================
 
-impl<A> SparseSetU<A>
+impl<'a, A> SparseSetU<'a, A>
 where
     A: Array,
     A::Item: Eq + Hash + Copy,
@@ -72,16 +80,18 @@ where
     fn upgrade(&mut self) {
         match self {
             SparseSetU::Large { .. } => panic!("SparseSetU: upgrade"),
-            SparseSetU::Small { card, arr } => {
+            SparseSetU::Small { card, arr, alloc } => {
                 assert!(*card == A::size());
-                let mut set = FxHashSet::<A::Item>::default();
-                set.reserve(A::size());
+                let mut set = alloc.set(A::size());
                 // Could this be done faster?
                 let arr_p = arr.as_mut_ptr() as *mut A::Item;
                 for i in 0..*card {
                     set.insert(unsafe { read(arr_p.add(i)) });
                 }
-                *self = SparseSetU::Large { set }
+                *self = SparseSetU::Large {
+                    set,
+                    alloc: alloc.clone(),
+                }
             }
         }
     }
@@ -131,7 +141,7 @@ where
     fn maybe_downgrade(&mut self) {
         let small_halfmax_card = self.small_halfmax_card();
         match self {
-            SparseSetU::Large { set } => {
+            SparseSetU::Large { set, alloc } => {
                 if set.len() <= small_halfmax_card {
                     let mut arr = MaybeUninit::<A>::uninit();
                     let arr_p = arr.as_mut_ptr() as *mut A::Item;
@@ -141,7 +151,11 @@ where
                         i += 1;
                     }
                     assert!(i <= small_halfmax_card);
-                    *self = SparseSetU::Small { card: i, arr };
+                    *self = SparseSetU::Small {
+                        card: i,
+                        arr,
+                        alloc: alloc.clone(),
+                    };
                 }
             }
             SparseSetU::Small { .. } => {
@@ -153,10 +167,10 @@ where
     #[inline(always)]
     fn insert_no_dup_check(&mut self, item: A::Item) {
         match self {
-            SparseSetU::Large { set } => {
+            SparseSetU::Large { set, .. } => {
                 set.insert(item);
             }
-            SparseSetU::Small { card, arr } => {
+            SparseSetU::Small { card, arr, .. } => {
                 assert!(*card <= A::size());
                 if *card < A::size() {
                     // Stay small
@@ -169,7 +183,7 @@ where
                     // Transition up
                     self.upgrade();
                     match self {
-                        SparseSetU::Large { set } => {
+                        SparseSetU::Large { set, .. } => {
                             let _ = set.insert(item);
                         }
                         SparseSetU::Small { .. } => {
@@ -200,16 +214,17 @@ where
 
 // ================ Public methods ================
 
-impl<A> SparseSetU<A>
+impl<'a, A> SparseSetU<'a, A>
 where
     A: Array,
     A::Item: Eq + Hash + Copy,
 {
     #[inline(always)]
-    pub fn empty() -> Self {
+    pub fn empty(alloc: &Alloc<'a>) -> Self {
         SparseSetU::Small {
             card: 0,
             arr: MaybeUninit::uninit(),
+            alloc: alloc.clone(),
         }
     }
 
@@ -217,7 +232,7 @@ where
     pub fn is_empty(&self) -> bool {
         match self {
             SparseSetU::Small { card, .. } => *card == 0,
-            SparseSetU::Large { set } => {
+            SparseSetU::Large { set, .. } => {
                 // This holds because `maybe_downgrade` will always convert a
                 // zero-sized large variant into a small variant.
                 assert!(set.len() > 0);
@@ -229,7 +244,7 @@ where
     #[inline(never)]
     pub fn card(&self) -> usize {
         match self {
-            SparseSetU::Large { set } => set.len(),
+            SparseSetU::Large { set, .. } => set.len(),
             SparseSetU::Small { card, .. } => *card,
         }
     }
@@ -237,10 +252,10 @@ where
     #[inline(never)]
     pub fn insert(&mut self, item: A::Item) {
         match self {
-            SparseSetU::Large { set } => {
+            SparseSetU::Large { set, .. } => {
                 set.insert(item);
             }
-            SparseSetU::Small { card, arr } => {
+            SparseSetU::Small { card, arr, .. } => {
                 assert!(*card <= A::size());
                 // Do we already have it?
                 if small_contains(*card, arr, item) {
@@ -266,16 +281,16 @@ where
     #[inline(always)]
     pub fn contains(&self, item: A::Item) -> bool {
         match self {
-            SparseSetU::Large { set } => set.contains(&item),
-            SparseSetU::Small { card, arr } => small_contains(*card, arr, item),
+            SparseSetU::Large { set, .. } => set.contains(&item),
+            SparseSetU::Small { card, arr, .. } => small_contains(*card, arr, item),
         }
     }
 
     #[inline(never)]
     pub fn union(&mut self, other: &Self) {
         match self {
-            SparseSetU::Large { set: set1 } => match other {
-                SparseSetU::Large { set: set2 } => {
+            SparseSetU::Large { set: set1, .. } => match other {
+                SparseSetU::Large { set: set2, .. } => {
                     for item in set2.iter() {
                         set1.insert(*item);
                     }
@@ -283,6 +298,7 @@ where
                 SparseSetU::Small {
                     card: card2,
                     arr: arr2,
+                    ..
                 } => {
                     let arr2_p = arr2.as_ptr() as *const A::Item;
                     for i in 0..*card2 {
@@ -294,20 +310,25 @@ where
             SparseSetU::Small {
                 card: card1,
                 arr: arr1,
+                alloc,
             } => {
                 let arr1_p = arr1.as_mut_ptr() as *mut A::Item;
                 match other {
-                    SparseSetU::Large { set: set2 } => {
-                        let mut set2c = set2.clone();
+                    SparseSetU::Large { set: set2, .. } => {
+                        let mut set2c = alloc.clone_set(set2);
                         for i in 0..*card1 {
                             let item = unsafe { read(arr1_p.add(i)) };
                             set2c.insert(item);
                         }
-                        *self = SparseSetU::Large { set: set2c };
+                        *self = SparseSetU::Large {
+                            set: set2c,
+                            alloc: alloc.clone(),
+                        };
                     }
                     SparseSetU::Small {
                         card: card2,
                         arr: arr2,
+                        ..
                     } => {
                         let mut extras: MaybeUninit<A> = MaybeUninit::uninit();
                         let mut n_extras = 0;
@@ -347,9 +368,9 @@ where
     #[inline(never)]
     pub fn remove(&mut self, other: &Self) {
         match self {
-            SparseSetU::Large { set: set1 } => {
+            SparseSetU::Large { set: set1, .. } => {
                 match other {
-                    SparseSetU::Large { set: set2 } => {
+                    SparseSetU::Large { set: set2, .. } => {
                         for item in set2.iter() {
                             set1.remove(item);
                         }
@@ -357,6 +378,7 @@ where
                     SparseSetU::Small {
                         card: card2,
                         arr: arr2,
+                        ..
                     } => {
                         let arr2_p = arr2.as_ptr() as *const A::Item;
                         for i in 0..*card2 {
@@ -370,10 +392,11 @@ where
             SparseSetU::Small {
                 card: card1,
                 arr: arr1,
+                ..
             } => {
                 let arr1_p = arr1.as_mut_ptr() as *mut A::Item;
                 match other {
-                    SparseSetU::Large { set: set2 } => {
+                    SparseSetU::Large { set: set2, .. } => {
                         let mut w = 0;
                         for r in 0..*card1 {
                             let item = unsafe { read(arr1_p.add(r)) };
@@ -393,6 +416,7 @@ where
                     SparseSetU::Small {
                         card: card2,
                         arr: arr2,
+                        ..
                     } => {
                         let arr2_p = arr2.as_ptr() as *const A::Item;
                         let mut w = 0;
@@ -431,11 +455,12 @@ where
         // Visit all items in `self`, and see if they are in `other`.  If so
         // return true.
         match self {
-            SparseSetU::Large { set: set1 } => match other {
-                SparseSetU::Large { set: set2 } => set1.is_subset(set2),
+            SparseSetU::Large { set: set1, .. } => match other {
+                SparseSetU::Large { set: set2, .. } => set1.is_subset(set2),
                 SparseSetU::Small {
                     card: card2,
                     arr: arr2,
+                    ..
                 } => {
                     for item in set1.iter() {
                         if !small_contains(*card2, arr2, *item) {
@@ -448,10 +473,11 @@ where
             SparseSetU::Small {
                 card: card1,
                 arr: arr1,
+                ..
             } => {
                 let arr1_p = arr1.as_ptr() as *const A::Item;
                 match other {
-                    SparseSetU::Large { set: set2 } => {
+                    SparseSetU::Large { set: set2, .. } => {
                         for i in 0..*card1 {
                             let item = unsafe { read(arr1_p.add(i)) };
                             if !set2.contains(&item) {
@@ -463,6 +489,7 @@ where
                     SparseSetU::Small {
                         card: card2,
                         arr: arr2,
+                        ..
                     } => {
                         for i in 0..*card1 {
                             let item = unsafe { read(arr1_p.add(i)) };
@@ -478,7 +505,7 @@ where
     }
 
     #[inline(never)]
-    pub fn from_vec(vec: Vec<A::Item>) -> Self {
+    pub fn from_vec(vec: Vec<A::Item>, alloc: &Alloc<'a>) -> Self {
         let vec_len = vec.len();
         if vec_len <= A::size() {
             let mut card = 0;
@@ -492,13 +519,20 @@ where
                 unsafe { write(arr_p.add(card), item) }
                 card += 1;
             }
-            SparseSetU::Small { card, arr }
+            SparseSetU::Small {
+                card,
+                arr,
+                alloc: alloc.clone(),
+            }
         } else {
-            let mut set = FxHashSet::<A::Item>::default();
+            let mut set = alloc.set(vec_len);
             for i in 0..vec_len {
                 set.insert(vec[i]);
             }
-            SparseSetU::Large { set }
+            SparseSetU::Large {
+                set,
+                alloc: alloc.clone(),
+            }
         }
     }
 
@@ -508,15 +542,19 @@ where
             return false;
         }
         match (self, other) {
-            (SparseSetU::Large { set: set1 }, SparseSetU::Large { set: set2 }) => set1 == set2,
+            (SparseSetU::Large { set: set1, .. }, SparseSetU::Large { set: set2, .. }) => {
+                set1 == set2
+            }
             (
                 SparseSetU::Small {
                     card: card1,
                     arr: arr1,
+                    ..
                 },
                 SparseSetU::Small {
                     card: card2,
                     arr: arr2,
+                    ..
                 },
             ) => {
                 assert!(*card1 == *card2);
@@ -541,8 +579,8 @@ where
                 }
                 true
             }
-            (SparseSetU::Small { card, arr }, SparseSetU::Large { set })
-            | (SparseSetU::Large { set }, SparseSetU::Small { card, arr }) => {
+            (SparseSetU::Small { card, arr, .. }, SparseSetU::Large { set, .. })
+            | (SparseSetU::Large { set, .. }, SparseSetU::Small { card, arr, .. }) => {
                 // Same rationale as above as to why this is a sufficient test.
                 let arr_p = arr.as_ptr() as *const A::Item;
                 for i in 0..*card {
@@ -557,7 +595,7 @@ where
     }
 }
 
-impl<A> SparseSetU<A>
+impl<'a, A> SparseSetU<'a, A>
 where
     A: Array,
     A::Item: Eq + Ord + Hash + Copy + fmt::Debug,
@@ -566,12 +604,12 @@ where
     pub fn to_vec(&self) -> Vec<A::Item> {
         let mut res = Vec::<A::Item>::new();
         match self {
-            SparseSetU::Large { set } => {
+            SparseSetU::Large { set, .. } => {
                 for item in set.iter() {
                     res.push(*item);
                 }
             }
-            SparseSetU::Small { card, arr } => {
+            SparseSetU::Small { card, arr, .. } => {
                 let arr_p = arr.as_ptr() as *const A::Item;
                 for i in 0..*card {
                     res.push(unsafe { read(arr_p.add(i)) });
@@ -584,7 +622,7 @@ where
     }
 }
 
-impl<A> fmt::Debug for SparseSetU<A>
+impl<'a, A> fmt::Debug for SparseSetU<'a, A>
 where
     A: Array + Eq + Ord + Hash + Copy + fmt::Debug,
     A::Item: Eq + Ord + Hash + Copy + fmt::Debug,
@@ -608,7 +646,7 @@ where
     }
 }
 
-impl<A> Clone for SparseSetU<A>
+impl<'a, A> Clone for SparseSetU<'a, A>
 where
     A: Array + Eq + Hash + Copy + Clone,
     A::Item: Eq + Hash + Copy + Clone,
@@ -616,12 +654,16 @@ where
     #[inline(never)]
     fn clone(&self) -> Self {
         match self {
-            SparseSetU::Large { set } => SparseSetU::Large { set: set.clone() },
-            SparseSetU::Small { card, arr } => {
+            SparseSetU::Large { set, alloc } => SparseSetU::Large {
+                set: alloc.clone_set(set),
+                alloc: alloc.clone(),
+            },
+            SparseSetU::Small { card, arr, alloc } => {
                 let arr2 = arr.clone();
                 SparseSetU::Small {
                     card: *card,
                     arr: arr2,
+                    alloc: alloc.clone(),
                 }
             }
         }
@@ -630,7 +672,7 @@ where
 
 pub enum SparseSetUIter<'a, A: Array> {
     Large {
-        set_iter: std::collections::hash_set::Iter<'a, A::Item>,
+        set_iter: hashbrown::hash_set::Iter<'a, A::Item>,
     },
     Small {
         card: usize,
@@ -638,13 +680,13 @@ pub enum SparseSetUIter<'a, A: Array> {
         next: usize,
     },
 }
-impl<A: Array> SparseSetU<A> {
+impl<'a, A: Array> SparseSetU<'a, A> {
     pub fn iter(&self) -> SparseSetUIter<A> {
         match self {
-            SparseSetU::Large { set } => SparseSetUIter::Large {
+            SparseSetU::Large { set, .. } => SparseSetUIter::Large {
                 set_iter: set.iter(),
             },
-            SparseSetU::Small { card, arr } => SparseSetUIter::Small {
+            SparseSetU::Small { card, arr, .. } => SparseSetUIter::Small {
                 card: *card,
                 arr,
                 next: 0,
@@ -722,7 +764,11 @@ mod sparse_set_test_utils {
 #[test]
 fn test_sparse_set() {
     use crate::data_structures::Set;
-    let mut set = SparseSetU::<[u32; 3]>::empty();
+    use crate::Bump;
+    let bump = Bump::new();
+    let alloc = Alloc(&bump);
+
+    let mut set = SparseSetU::<[u32; 3]>::empty(&alloc);
     assert!(set.is_small());
     set.insert(3);
     assert!(set.is_small());
@@ -738,7 +784,7 @@ fn test_sparse_set() {
 
     // empty
     {
-        let spa = SparseSetU::<[u32; 10]>::empty();
+        let spa = SparseSetU::<[u32; 10]>::empty(&alloc);
         assert!(spa.card() == 0);
     }
 
@@ -748,7 +794,7 @@ fn test_sparse_set() {
             let size1 = n1 % 25;
             let vec1a = rng.rand_vec(size1);
             let vec1b = vec1a.clone(); // This is very stupid.
-            let spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a);
+            let spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a, &alloc);
             let std1 = Set::<u32>::from_vec(vec1b);
             assert!(spa1.card() == std1.card());
             assert!(spa1.is_empty() == (size1 == 0));
@@ -762,7 +808,7 @@ fn test_sparse_set() {
             let vec1a = rng.rand_vec(size1);
             let vec1b = vec1a.clone();
             let tmp = if size1 == 0 { 0 } else { vec1a[0] };
-            let mut spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a);
+            let mut spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a, &alloc);
             let mut std1 = Set::<u32>::from_vec(vec1b);
             // Insert an item which is almost certainly not in the set.
             let n = rng.rand();
@@ -787,7 +833,7 @@ fn test_sparse_set() {
             let vec1a = rng.rand_vec(size1);
             let vec1b = vec1a.clone();
             let tmp = if size1 == 0 { 0 } else { vec1a[0] };
-            let spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a);
+            let spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a, &alloc);
             let std1 = Set::<u32>::from_vec(vec1b);
             // Check for an item which is almost certainly not in the set.
             let n = rng.rand();
@@ -807,8 +853,8 @@ fn test_sparse_set() {
                 let vec2a = rng.rand_vec(size2);
                 let vec1b = vec1a.clone();
                 let vec2b = vec2a.clone();
-                let mut spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a);
-                let spa2 = SparseSetU::<[u32; 10]>::from_vec(vec2a);
+                let mut spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a, &alloc);
+                let spa2 = SparseSetU::<[u32; 10]>::from_vec(vec2a, &alloc);
                 let mut std1 = Set::<u32>::from_vec(vec1b);
                 let std2 = Set::<u32>::from_vec(vec2b);
                 spa1.union(&spa2);
@@ -826,8 +872,8 @@ fn test_sparse_set() {
                 let vec2a = rng.rand_vec(size2);
                 let vec1b = vec1a.clone();
                 let vec2b = vec2a.clone();
-                let mut spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a);
-                let spa2 = SparseSetU::<[u32; 10]>::from_vec(vec2a);
+                let mut spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a, &alloc);
+                let spa2 = SparseSetU::<[u32; 10]>::from_vec(vec2a, &alloc);
                 let mut std1 = Set::<u32>::from_vec(vec1b);
                 let std2 = Set::<u32>::from_vec(vec2b);
                 spa1.remove(&spa2);
@@ -845,8 +891,8 @@ fn test_sparse_set() {
                 let vec2a = rng.rand_vec(size2);
                 let vec1b = vec1a.clone();
                 let vec2b = vec2a.clone();
-                let spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a);
-                let spa2 = SparseSetU::<[u32; 10]>::from_vec(vec2a);
+                let spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a, &alloc);
+                let spa2 = SparseSetU::<[u32; 10]>::from_vec(vec2a, &alloc);
                 let std1 = Set::<u32>::from_vec(vec1b);
                 let std2 = Set::<u32>::from_vec(vec2b);
                 assert!(spa1.is_subset_of(&spa2) == std1.is_subset_of(&std2));
@@ -866,8 +912,8 @@ fn test_sparse_set() {
                 let vec2a = rng.rand_vec(size2);
                 let vec1b = vec1a.clone();
                 let vec2b = vec2a.clone();
-                let spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a);
-                let spa2 = SparseSetU::<[u32; 10]>::from_vec(vec2a);
+                let spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a, &alloc);
+                let spa2 = SparseSetU::<[u32; 10]>::from_vec(vec2a, &alloc);
                 let std1 = Set::<u32>::from_vec(vec1b);
                 let std2 = Set::<u32>::from_vec(vec2b);
                 assert!(std1.equals(&std1)); // obviously
@@ -885,7 +931,7 @@ fn test_sparse_set() {
         for n1 in 0..100 {
             let size1 = n1 % 25;
             let vec1a = rng.rand_vec(size1);
-            let spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a);
+            let spa1 = SparseSetU::<[u32; 10]>::from_vec(vec1a, &alloc);
             let spa2 = spa1.clone();
             assert!(spa1.equals(&spa2));
         }

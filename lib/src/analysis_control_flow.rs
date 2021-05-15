@@ -7,8 +7,7 @@ use crate::analysis_main::AnalysisError;
 use crate::data_structures::{BlockIx, InstIx, Range, Set, TypedIxVec};
 use crate::sparse_set::{SparseSetU, SparseSetUIter};
 use crate::Function;
-
-use smallvec::SmallVec;
+use crate::{Alloc, BumpSmallVec, BumpVec};
 
 //=============================================================================
 // Debugging config.  Set all these to `false` for normal operation.
@@ -28,14 +27,14 @@ const CROSSCHECK_DOMS: bool = false;
 // This is trivial, but it's sometimes useful to have.
 // Note: confusingly, the `Range` here is data_structures::Range, not
 // std::ops::Range.
-pub struct InstIxToBlockIxMap {
-    vek: TypedIxVec<BlockIx, Range<InstIx>>,
+pub struct InstIxToBlockIxMap<'a> {
+    vek: TypedIxVec<'a, BlockIx, Range<InstIx>>,
 }
 
-impl InstIxToBlockIxMap {
+impl<'a> InstIxToBlockIxMap<'a> {
     #[inline(never)]
-    pub fn new<F: Function>(func: &F) -> Self {
-        let mut vek = TypedIxVec::<BlockIx, Range<InstIx>>::new();
+    pub fn new<F: Function>(func: &F, alloc: &Alloc<'a>) -> Self {
+        let mut vek = TypedIxVec::<BlockIx, Range<InstIx>>::new(alloc);
         for bix in func.blocks() {
             let r: Range<InstIx> = func.block_insns(bix);
             assert!(r.start() <= r.last_plus1());
@@ -100,12 +99,13 @@ impl InstIxToBlockIxMap {
 
 // Returned TypedIxVecs contain one element per block
 #[inline(never)]
-fn calc_preds_and_succs<F: Function>(
+fn calc_preds_and_succs<'a, F: Function>(
     func: &F,
     num_blocks: u32,
+    alloc: &Alloc<'a>,
 ) -> (
-    TypedIxVec<BlockIx, SparseSetU<[BlockIx; 4]>>,
-    TypedIxVec<BlockIx, SparseSetU<[BlockIx; 4]>>,
+    TypedIxVec<'a, BlockIx, SparseSetU<'a, [BlockIx; 4]>>,
+    TypedIxVec<'a, BlockIx, SparseSetU<'a, [BlockIx; 4]>>,
 ) {
     info!("      calc_preds_and_succs: begin");
 
@@ -117,9 +117,9 @@ fn calc_preds_and_succs<F: Function>(
     // Func::finish() ensures that all blocks are non-empty, and that only the
     // last instruction is a control flow transfer.  Hence the following won't
     // miss any edges.
-    let mut succ_map = TypedIxVec::<BlockIx, SparseSetU<[BlockIx; 4]>>::new();
+    let mut succ_map = TypedIxVec::<BlockIx, SparseSetU<[BlockIx; 4]>>::new(alloc);
     for b in func.blocks() {
-        let mut bix_set = SparseSetU::<[BlockIx; 4]>::empty();
+        let mut bix_set = SparseSetU::<[BlockIx; 4]>::empty(alloc);
         for bix in func.block_succs(b).iter() {
             bix_set.insert(*bix);
         }
@@ -127,8 +127,8 @@ fn calc_preds_and_succs<F: Function>(
     }
 
     // Now invert the mapping
-    let mut pred_map = TypedIxVec::<BlockIx, SparseSetU<[BlockIx; 4]>>::new();
-    pred_map.resize(num_blocks, SparseSetU::<[BlockIx; 4]>::empty());
+    let mut pred_map = TypedIxVec::<BlockIx, SparseSetU<[BlockIx; 4]>>::new(alloc);
+    pred_map.resize(num_blocks, SparseSetU::<[BlockIx; 4]>::empty(alloc));
     for (src, dst_set) in (0..).zip(succ_map.iter()) {
         for dst in dst_set.iter() {
             pred_map[*dst].insert(BlockIx::new(src));
@@ -162,22 +162,23 @@ fn calc_preds_and_succs<F: Function>(
 // sequences do not contain `num_blocks` elements, in which case the input
 // contains blocks not reachable from the entry point, and is invalid.
 #[inline(never)]
-fn calc_preord_and_postord<F: Function>(
+fn calc_preord_and_postord<'a, F: Function>(
     func: &F,
     num_blocks: u32,
-    succ_map: &TypedIxVec<BlockIx, SparseSetU<[BlockIx; 4]>>,
-) -> Option<(Vec<BlockIx>, Vec<BlockIx>)> {
+    succ_map: &TypedIxVec<BlockIx, SparseSetU<'a, [BlockIx; 4]>>,
+    alloc: &Alloc<'a>,
+) -> Option<(BumpVec<'a, BlockIx>, BumpVec<'a, BlockIx>)> {
     info!("      calc_preord_and_postord: begin");
 
-    let mut pre_ord = Vec::<BlockIx>::new();
-    let mut post_ord = Vec::<BlockIx>::new();
+    let mut pre_ord = alloc.vec(num_blocks as usize);
+    let mut post_ord = alloc.vec(num_blocks as usize);
 
-    let mut visited = TypedIxVec::<BlockIx, bool>::new();
+    let mut visited = TypedIxVec::<BlockIx, bool>::new(alloc);
     visited.resize(num_blocks, false);
 
     // Set up initial state: entry block on the stack, marked as visited, and placed at the
     // start of the pre-ord sequence.
-    let mut stack = SmallVec::<[(BlockIx, SparseSetUIter<[BlockIx; 4]>); 64]>::new();
+    let mut stack = BumpSmallVec::<[(BlockIx, SparseSetUIter<[BlockIx; 4]>); 64]>::new(alloc);
     let bix_entry = func.entry_block();
     visited[bix_entry] = true;
     pre_ord.push(bix_entry);
@@ -219,11 +220,11 @@ fn calc_preord_and_postord<F: Function>(
     assert!(post_ord.len() == num_blocks as usize);
     #[cfg(debug_assertions)]
     {
-        let mut pre_ord_sorted: Vec<BlockIx> = pre_ord.clone();
-        let mut post_ord_sorted: Vec<BlockIx> = post_ord.clone();
+        let mut pre_ord_sorted = pre_ord.clone();
+        let mut post_ord_sorted = post_ord.clone();
         pre_ord_sorted.sort_by(|bix1, bix2| bix1.get().partial_cmp(&bix2.get()).unwrap());
         post_ord_sorted.sort_by(|bix1, bix2| bix1.get().partial_cmp(&bix2.get()).unwrap());
-        let expected: Vec<BlockIx> = (0..num_blocks).map(|u| BlockIx::new(u)).collect();
+        let expected = alloc.collect((0..num_blocks).map(|u| BlockIx::new(u)));
         debug_assert!(pre_ord_sorted == expected);
         debug_assert!(post_ord_sorted == expected);
     }
@@ -241,21 +242,21 @@ fn calc_preord_and_postord<F: Function>(
 // dominate it. This algorithm is from Fig 7.14 of Muchnick 1997. The
 // algorithm is described as simple but not as performant as some others.
 #[inline(never)]
-fn calc_dom_sets_slow(
+fn calc_dom_sets_slow<'a>(
     num_blocks: u32,
-    pred_map: &TypedIxVec<BlockIx, SparseSetU<[BlockIx; 4]>>,
-    post_ord: &Vec<BlockIx>,
+    pred_map: &TypedIxVec<'a, BlockIx, SparseSetU<[BlockIx; 4]>>,
+    post_ord: &[BlockIx],
     start: BlockIx,
-) -> TypedIxVec<BlockIx, Set<BlockIx>> {
+    alloc: &Alloc<'a>,
+) -> TypedIxVec<'a, BlockIx, Set<BlockIx>> {
     info!("          calc_dom_sets_slow: begin");
 
-    let mut dom_map = TypedIxVec::<BlockIx, Set<BlockIx>>::new();
+    let mut dom_map = TypedIxVec::<BlockIx, Set<BlockIx>>::new(alloc);
 
     // FIXME find better names for n/d/t sets.
     {
         let root: BlockIx = start;
-        let n_set: Set<BlockIx> =
-            Set::from_vec((0..num_blocks).map(|bix| BlockIx::new(bix)).collect());
+        let n_set = Set::from_vec((0..num_blocks).map(|bix| BlockIx::new(bix)).collect());
         let mut d_set: Set<BlockIx>;
         let mut t_set: Set<BlockIx>;
 
@@ -325,9 +326,9 @@ const DT_INVALID_POSTORD: u32 = 0xFFFF_FFFF;
 const DT_INVALID_BLOCKIX: BlockIx = BlockIx::BlockIx(0xFFFF_FFFF);
 
 // Helper
-fn dt_merge_sets(
-    idom: &TypedIxVec<BlockIx, BlockIx>,
-    bix2rpostord: &TypedIxVec<BlockIx, u32>,
+fn dt_merge_sets<'a>(
+    idom: &TypedIxVec<'a, BlockIx, BlockIx>,
+    bix2rpostord: &TypedIxVec<'a, BlockIx, u32>,
     mut node1: BlockIx,
     mut node2: BlockIx,
 ) -> BlockIx {
@@ -348,12 +349,13 @@ fn dt_merge_sets(
 }
 
 #[inline(never)]
-fn calc_dom_tree(
+fn calc_dom_tree<'a>(
     num_blocks: u32,
-    pred_map: &TypedIxVec<BlockIx, SparseSetU<[BlockIx; 4]>>,
-    post_ord: &Vec<BlockIx>,
+    pred_map: &TypedIxVec<'a, BlockIx, SparseSetU<[BlockIx; 4]>>,
+    post_ord: &[BlockIx],
     start: BlockIx,
-) -> TypedIxVec<BlockIx, BlockIx> {
+    alloc: &Alloc<'a>,
+) -> TypedIxVec<'a, BlockIx, BlockIx> {
     info!("        calc_dom_tree: begin");
 
     // We use 2^32-1 as a marker for an invalid BlockIx or postorder number.
@@ -365,8 +367,8 @@ fn calc_dom_tree(
     // Compute bix2rpostord, which maps a BlockIx to its reverse postorder
     // number.  And rpostord2bix, which maps a reverse postorder number to its
     // BlockIx.
-    let mut bix2rpostord = TypedIxVec::<BlockIx, u32>::new();
-    let mut rpostord2bix = Vec::<BlockIx>::new();
+    let mut bix2rpostord = TypedIxVec::<BlockIx, u32>::new(alloc);
+    let mut rpostord2bix = alloc.vec(num_blocks as usize);
     bix2rpostord.resize(num_blocks, DT_INVALID_POSTORD);
     rpostord2bix.resize(num_blocks as usize, DT_INVALID_BLOCKIX);
     for n in 0..num_blocks {
@@ -381,7 +383,7 @@ fn calc_dom_tree(
         debug_assert!(bix2rpostord[BlockIx::new(n)] < num_blocks);
     }
 
-    let mut idom = TypedIxVec::<BlockIx, BlockIx>::new();
+    let mut idom = TypedIxVec::<BlockIx, BlockIx>::new(alloc);
     idom.resize(num_blocks, DT_INVALID_BLOCKIX);
 
     // The start node must have itself as a parent.
@@ -462,7 +464,7 @@ fn calc_dom_tree(
         // what the simple algorithm produced.
 
         info!("        calc_dom_tree crosscheck: begin");
-        let slow_sets = calc_dom_sets_slow(num_blocks, pred_map, post_ord, start);
+        let slow_sets = calc_dom_sets_slow(num_blocks, pred_map, post_ord, start, alloc);
         assert!(slow_sets.len() == idom.len());
 
         for i in 0..num_blocks {
@@ -489,15 +491,16 @@ fn calc_dom_tree(
 // Computation of per-block loop-depths
 
 #[inline(never)]
-fn calc_loop_depths(
+fn calc_loop_depths<'a>(
     num_blocks: u32,
-    pred_map: &TypedIxVec<BlockIx, SparseSetU<[BlockIx; 4]>>,
-    succ_map: &TypedIxVec<BlockIx, SparseSetU<[BlockIx; 4]>>,
-    post_ord: &Vec<BlockIx>,
+    pred_map: &TypedIxVec<'a, BlockIx, SparseSetU<[BlockIx; 4]>>,
+    succ_map: &TypedIxVec<'a, BlockIx, SparseSetU<[BlockIx; 4]>>,
+    post_ord: &[BlockIx],
     start: BlockIx,
-) -> TypedIxVec<BlockIx, u32> {
+    alloc: &Alloc<'a>,
+) -> TypedIxVec<'a, BlockIx, u32> {
     info!("      calc_loop_depths: begin");
-    let idom = calc_dom_tree(num_blocks, pred_map, post_ord, start);
+    let idom = calc_dom_tree(num_blocks, pred_map, post_ord, start, alloc);
 
     // Find the loops.  First, find the "loop header nodes", and from those,
     // derive the loops.
@@ -600,7 +603,7 @@ fn calc_loop_depths(
 
     // Now that we have a depth for each loop, we can finally compute the depth
     // for each block.
-    let mut depth_map = TypedIxVec::<BlockIx, u32>::new();
+    let mut depth_map = TypedIxVec::<BlockIx, u32>::new(alloc);
     depth_map.resize(num_blocks, 0);
     for (loop_block_indexes, depth) in natural_loops.iter().zip(loop_depths) {
         for loop_block_ix in loop_block_indexes.iter() {
@@ -633,26 +636,26 @@ fn calc_loop_depths(
 // preord and postord sequences, and loop depths.
 
 // CFGInfo contains CFG-related info computed from a Func.
-pub struct CFGInfo {
+pub struct CFGInfo<'a> {
     // All these TypedIxVecs and plain Vecs contain one element per Block in the
     // Func.
 
     // Predecessor and successor maps.
-    pub pred_map: TypedIxVec<BlockIx, SparseSetU<[BlockIx; 4]>>,
-    pub succ_map: TypedIxVec<BlockIx, SparseSetU<[BlockIx; 4]>>,
+    pub pred_map: TypedIxVec<'a, BlockIx, SparseSetU<'a, [BlockIx; 4]>>,
+    pub succ_map: TypedIxVec<'a, BlockIx, SparseSetU<'a, [BlockIx; 4]>>,
 
     // Pre- and post-order sequences.  Iterating forwards through these
     // vectors enumerates the blocks in preorder and postorder respectively.
-    pub pre_ord: Vec<BlockIx>,
-    pub _post_ord: Vec<BlockIx>,
+    pub pre_ord: BumpVec<'a, BlockIx>,
+    pub _post_ord: BumpVec<'a, BlockIx>,
 
     // This maps from a Block to the loop depth that it is at
-    pub depth_map: TypedIxVec<BlockIx, u32>,
+    pub depth_map: TypedIxVec<'a, BlockIx, u32>,
 }
 
-impl CFGInfo {
+impl<'a> CFGInfo<'a> {
     #[inline(never)]
-    pub fn create<F: Function>(func: &F) -> Result<Self, AnalysisError> {
+    pub fn create<F: Function>(func: &F, alloc: &Alloc<'a>) -> Result<Self, AnalysisError> {
         info!("    CFGInfo::create: begin");
 
         // Throw out insanely large inputs.  They'll probably cause failure later
@@ -680,7 +683,7 @@ impl CFGInfo {
 
         // === BEGIN compute successor and predecessor maps ===
         //
-        let (pred_map, succ_map) = calc_preds_and_succs(func, num_blocks);
+        let (pred_map, succ_map) = calc_preds_and_succs(func, num_blocks, alloc);
         assert!(pred_map.len() == num_blocks);
         assert!(succ_map.len() == num_blocks);
         //
@@ -706,7 +709,7 @@ impl CFGInfo {
 
         // === BEGIN compute preord/postord sequences ===
         //
-        let mb_pre_ord_and_post_ord = calc_preord_and_postord(func, num_blocks, &succ_map);
+        let mb_pre_ord_and_post_ord = calc_preord_and_postord(func, num_blocks, &succ_map, alloc);
         if mb_pre_ord_and_post_ord.is_none() {
             return Err(AnalysisError::UnreachableBlocks);
         }
@@ -723,8 +726,9 @@ impl CFGInfo {
             num_blocks,
             &pred_map,
             &succ_map,
-            &post_ord,
+            &post_ord[..],
             func.entry_block(),
+            alloc,
         );
         debug_assert!(depth_map.len() == num_blocks);
         //

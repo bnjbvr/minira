@@ -1,16 +1,15 @@
 use super::{
-    analysis::BlockPos, last_use, next_use, IntId, Intervals, Mention, MentionMap,
-    OptimalSplitStrategy, RegUses, Statistics, VirtualInterval,
+    analysis::BlockPos, last_use, next_use, IntId, Intervals, OptimalSplitStrategy, RegUses,
+    Statistics, VirtualInterval,
 };
 use crate::{
     data_structures::{InstPoint, Point, RegVecsAndBounds},
-    Function, InstIx, LinearScanOptions, RealReg, RealRegUniverse, Reg, RegAllocError, SpillSlot,
+    Function, InstIx, LinearScanOptions, RealReg, RealRegUniverse, RegAllocError, SpillSlot,
     VirtualReg, NUM_REG_CLASSES,
 };
+use crate::{Alloc, BumpMap, BumpSmallVec, BumpVec};
 
 use log::{debug, info, log_enabled, trace, Level};
-use rustc_hash::FxHashMap as HashMap;
-use smallvec::SmallVec;
 use std::collections::BinaryHeap;
 use std::{cmp, cmp::Ordering, fmt};
 
@@ -41,21 +40,25 @@ impl fmt::Debug for ActiveInt {
     }
 }
 
-struct ActivityTracker {
+struct ActivityTracker<'a> {
     /// Intervals that are covering the current interval's start position.
     /// TODO Invariant: they always have a register attached to them.
-    active: Vec<ActiveInt>,
+    active: BumpVec<'a, ActiveInt>,
 
     /// Intervals that are not covering but end after the current interval's start position.
     /// None means that the interval may have fragments, but they all live after the current
     /// position.
     /// TODO Invariant: they're all fixed registers, so they must have a register attached to them.
-    inactive: Vec<(RealReg, usize)>,
+    inactive: BumpVec<'a, (RealReg, usize)>,
 }
 
-impl ActivityTracker {
-    fn new(intervals: &Intervals, scratches_by_rc: &[Option<RealReg>]) -> Self {
-        let mut inactive = Vec::with_capacity(intervals.fixeds.len());
+impl<'a> ActivityTracker<'a> {
+    fn new(
+        intervals: &Intervals<'a>,
+        scratches_by_rc: &[Option<RealReg>],
+        alloc: &Alloc<'a>,
+    ) -> Self {
+        let mut inactive = alloc.vec(intervals.fixeds.len());
         for fixed in &intervals.fixeds {
             let rreg = fixed.reg;
             if !fixed.frags.is_empty() && scratches_by_rc[rreg.get_class() as usize] != Some(rreg) {
@@ -64,7 +67,7 @@ impl ActivityTracker {
         }
 
         Self {
-            active: Vec::new(),
+            active: alloc.vec(16),
             inactive,
         }
     }
@@ -73,13 +76,19 @@ impl ActivityTracker {
         self.active.push(ActiveInt::Virtual(id));
     }
 
-    fn update(&mut self, start: InstPoint, stats: &mut Option<Statistics>, intervals: &Intervals) {
+    fn update(
+        &mut self,
+        start: InstPoint,
+        stats: &mut Option<Statistics>,
+        intervals: &Intervals<'a>,
+        alloc: &Alloc<'a>,
+    ) {
         // From active, only possible transitions are to active or expired.
         // From inactive, only possible transitions are to inactive, active or expired.
         // => active has an upper bound.
         // => inactive only shrinks.
-        let mut to_delete: SmallVec<[usize; 16]> = SmallVec::new();
-        let mut new_inactive: SmallVec<[(RealReg, usize); 16]> = SmallVec::new();
+        let mut to_delete: BumpSmallVec<[usize; 16]> = BumpSmallVec::new(alloc);
+        let mut new_inactive: BumpSmallVec<[(RealReg, usize); 16]> = BumpSmallVec::new(alloc);
 
         for (i, id) in self.active.iter_mut().enumerate() {
             match id {
@@ -158,7 +167,7 @@ impl ActivityTracker {
         for &i in to_delete.iter().rev() {
             self.inactive.swap_remove(i);
         }
-        self.inactive.extend(new_inactive.into_vec());
+        self.inactive.extend(new_inactive.into_bumpvec());
 
         trace!("active:");
         for aid in &self.active {
@@ -188,17 +197,26 @@ impl ActivityTracker {
     }
 }
 
-pub(crate) fn run<F: Function>(
+pub(crate) fn run<'a, F: Function>(
     opts: &LinearScanOptions,
     func: &F,
-    reg_uses: &RegVecsAndBounds,
+    reg_uses: &RegVecsAndBounds<'a>,
     reg_universe: &RealRegUniverse,
     scratches_by_rc: &[Option<RealReg>],
-    intervals: Intervals,
+    intervals: Intervals<'a>,
     stats: Option<Statistics>,
-) -> Result<(Intervals, u32), RegAllocError> {
-    let mut state = State::new(opts, func, &reg_uses, scratches_by_rc, intervals, stats);
-    let mut reusable = ReusableState::new(reg_universe, scratches_by_rc);
+    alloc: &Alloc<'a>,
+) -> Result<(Intervals<'a>, u32), RegAllocError> {
+    let mut state = State::new(
+        opts,
+        func,
+        &reg_uses,
+        scratches_by_rc,
+        intervals,
+        stats,
+        alloc,
+    );
+    let mut reusable = ReusableState::new(reg_universe, scratches_by_rc, alloc);
 
     #[cfg(debug_assertions)]
     let mut prev_start = InstPoint::min_value();
@@ -218,15 +236,15 @@ pub(crate) fn run<F: Function>(
 
             state
                 .activity
-                .update(int.start, &mut state.stats, &state.intervals);
+                .update(int.start, &mut state.stats, &state.intervals, alloc);
 
-            let ok = try_allocate_reg(&mut reusable, id, &mut state);
+            let ok = try_allocate_reg(&mut reusable, id, &mut state, alloc);
             if !ok {
-                allocate_blocked_reg(&mut reusable, id, &mut state)?;
+                allocate_blocked_reg(&mut reusable, id, &mut state, alloc)?;
             }
 
             if state.intervals.get(id).location.reg().is_some() {
-                if maybe_handle_safepoints(&mut state, id) {
+                if maybe_handle_safepoints(&mut state, id, alloc) {
                     // Even it if may have been spilled (because of a safepoint), the parent
                     // interval may still be active.
                     state.activity.set_active(id);
@@ -253,22 +271,23 @@ pub(crate) fn run<F: Function>(
 
 /// A mapping from real reg to some T.
 #[derive(Clone)]
-struct RegisterMapping<T> {
+struct RegisterMapping<'a, T> {
     offset: usize,
-    regs: Vec<(RealReg, T)>,
+    regs: BumpVec<'a, (RealReg, T)>,
     scratch: Option<RealReg>,
     initial_value: T,
     reg_class_index: usize,
 }
 
-impl<T: Copy> RegisterMapping<T> {
+impl<'a, T: Copy> RegisterMapping<'a, T> {
     fn with_default(
         reg_class_index: usize,
         reg_universe: &RealRegUniverse,
         scratch: Option<RealReg>,
         initial_value: T,
+        alloc: &Alloc<'a>,
     ) -> Self {
-        let mut regs = Vec::new();
+        let mut regs = alloc.vec(0);
         let mut offset = 0;
         // Collect all the registers for the current class.
         if let Some(ref info) = reg_universe.allocable_by_class[reg_class_index] {
@@ -294,7 +313,7 @@ impl<T: Copy> RegisterMapping<T> {
         }
     }
 
-    fn iter<'a>(&'a self) -> RegisterMappingIter<T> {
+    fn iter<'b>(&'b self) -> RegisterMappingIter<'b, T> {
         RegisterMappingIter {
             iter: self.regs.iter(),
             scratch: self.scratch,
@@ -324,7 +343,7 @@ impl<'a, T: Copy> std::iter::Iterator for RegisterMappingIter<'a, T> {
     }
 }
 
-impl<T> std::ops::Index<RealReg> for RegisterMapping<T> {
+impl<'a, T> std::ops::Index<RealReg> for RegisterMapping<'a, T> {
     type Output = T;
     fn index(&self, rreg: RealReg) -> &Self::Output {
         lsra_assert!(
@@ -339,7 +358,7 @@ impl<T> std::ops::Index<RealReg> for RegisterMapping<T> {
     }
 }
 
-impl<T> std::ops::IndexMut<RealReg> for RegisterMapping<T> {
+impl<'a, T> std::ops::IndexMut<RealReg> for RegisterMapping<'a, T> {
     fn index_mut(&mut self, rreg: RealReg) -> &mut Self::Output {
         lsra_assert!(
             rreg.get_class() as usize == self.reg_class_index,
@@ -356,16 +375,20 @@ impl<T> std::ops::IndexMut<RealReg> for RegisterMapping<T> {
 // State management.
 
 /// Parts of state just reused for recycling memory.
-struct ReusableState {
-    inactive_intersecting: Vec<(RealReg, InstPoint)>,
+struct ReusableState<'a> {
+    inactive_intersecting: BumpVec<'a, (RealReg, InstPoint)>,
     computed_inactive: bool,
-    reg_to_instpoint_1: Vec<RegisterMapping<InstPoint>>,
-    reg_to_instpoint_2: Vec<RegisterMapping<InstPoint>>,
+    reg_to_instpoint_1: BumpVec<'a, RegisterMapping<'a, InstPoint>>,
+    reg_to_instpoint_2: BumpVec<'a, RegisterMapping<'a, InstPoint>>,
 }
 
-impl ReusableState {
-    fn new(reg_universe: &RealRegUniverse, scratches: &[Option<RealReg>]) -> Self {
-        let mut reg_to_instpoint_1 = Vec::with_capacity(NUM_REG_CLASSES);
+impl<'a> ReusableState<'a> {
+    fn new(
+        reg_universe: &RealRegUniverse,
+        scratches: &[Option<RealReg>],
+        alloc: &Alloc<'a>,
+    ) -> Self {
+        let mut reg_to_instpoint_1 = alloc.vec(NUM_REG_CLASSES);
 
         for i in 0..NUM_REG_CLASSES {
             let scratch = scratches[i];
@@ -374,13 +397,14 @@ impl ReusableState {
                 reg_universe,
                 scratch,
                 InstPoint::max_value(),
+                alloc,
             ));
         }
 
-        let reg_to_instpoint_2 = reg_to_instpoint_1.clone();
+        let reg_to_instpoint_2 = alloc.collect(reg_to_instpoint_1.iter().cloned());
 
         Self {
-            inactive_intersecting: Vec::new(),
+            inactive_intersecting: alloc.vec(0),
             computed_inactive: false,
             reg_to_instpoint_1,
             reg_to_instpoint_2,
@@ -446,12 +470,12 @@ impl UnhandledIntervals {
 
 /// State structure, which can be cleared between different calls to register allocation.
 /// TODO: split this into clearable fields and non-clearable fields.
-struct State<'a, F: Function> {
+struct State<'a, 'arena, F: Function> {
     func: &'a F,
-    reg_uses: &'a RegUses,
+    reg_uses: &'a RegUses<'arena>,
     opts: &'a LinearScanOptions,
 
-    intervals: Intervals,
+    intervals: Intervals<'arena>,
 
     /// Intervals that are starting after the current interval's start position.
     unhandled: UnhandledIntervals,
@@ -461,27 +485,28 @@ struct State<'a, F: Function> {
 
     /// Maps given virtual registers to the spill slots they should be assigned
     /// to.
-    spill_map: HashMap<VirtualReg, SpillSlot>,
+    spill_map: BumpMap<'arena, VirtualReg, SpillSlot>,
 
-    activity: ActivityTracker,
+    activity: ActivityTracker<'arena>,
     stats: Option<Statistics>,
 }
 
-impl<'a, F: Function> State<'a, F> {
+impl<'a, 'arena, F: Function> State<'a, 'arena, F> {
     fn new(
         opts: &'a LinearScanOptions,
         func: &'a F,
-        reg_uses: &'a RegUses,
+        reg_uses: &'a RegUses<'arena>,
         scratches_by_rc: &[Option<RealReg>],
-        intervals: Intervals,
+        intervals: Intervals<'arena>,
         stats: Option<Statistics>,
+        alloc: &Alloc<'arena>,
     ) -> Self {
         let mut unhandled = UnhandledIntervals::new();
         for int in intervals.virtuals.iter() {
             unhandled.insert(int.id, &intervals);
         }
 
-        let activity = ActivityTracker::new(&intervals, scratches_by_rc);
+        let activity = ActivityTracker::new(&intervals, scratches_by_rc, alloc);
 
         Self {
             func,
@@ -490,7 +515,7 @@ impl<'a, F: Function> State<'a, F> {
             intervals,
             unhandled,
             next_spill_slot: SpillSlot::new(0),
-            spill_map: HashMap::default(),
+            spill_map: alloc.map(16),
             stats,
             activity,
         }
@@ -524,11 +549,11 @@ impl<'a, F: Function> State<'a, F> {
 }
 
 #[inline(never)]
-fn lazy_compute_inactive(
+fn lazy_compute_inactive<'a>(
     intervals: &Intervals,
     activity: &ActivityTracker,
     cur_id: IntId,
-    inactive_intersecting: &mut Vec<(RealReg, InstPoint)>,
+    inactive_intersecting: &mut BumpVec<'a, (RealReg, InstPoint)>,
     computed_inactive: &mut bool,
 ) {
     if *computed_inactive {
@@ -667,10 +692,11 @@ fn select_naive_reg<F: Function>(
 }
 
 #[inline(never)]
-fn try_allocate_reg<F: Function>(
+fn try_allocate_reg<'a, F: Function>(
     reusable: &mut ReusableState,
     id: IntId,
-    state: &mut State<F>,
+    state: &mut State<'_, 'a, F>,
+    alloc: &Alloc<'a>,
 ) -> bool {
     state
         .stats
@@ -689,7 +715,7 @@ fn try_allocate_reg<F: Function>(
     );
 
     if best_pos <= state.intervals.get(id).end {
-        if !state.opts.partial_split || !try_split_regs(state, id, best_pos) {
+        if !state.opts.partial_split || !try_split_regs(state, id, best_pos, alloc) {
             return false;
         }
     }
@@ -712,10 +738,11 @@ fn try_allocate_reg<F: Function>(
 }
 
 #[inline(never)]
-fn allocate_blocked_reg<F: Function>(
+fn allocate_blocked_reg<'a, F: Function>(
     reusable: &mut ReusableState,
     cur_id: IntId,
-    state: &mut State<F>,
+    state: &mut State<'_, 'a, F>,
+    alloc: &Alloc<'a>,
 ) -> Result<(), RegAllocError> {
     // If the current interval has no uses, spill it directly.
     let first_use = match next_use(
@@ -847,7 +874,7 @@ fn allocate_blocked_reg<F: Function>(
             return Err(RegAllocError::OutOfRegisters(reg_class));
         }
         debug!("spill current interval");
-        let new_int = split(state, cur_id, first_use);
+        let new_int = split(state, cur_id, first_use, alloc);
         state.insert_unhandled(new_int);
         state.spill(cur_id);
     } else {
@@ -865,8 +892,10 @@ fn allocate_blocked_reg<F: Function>(
                 block_pos[best_reg], int_end
             );
 
-            if !state.opts.partial_split || !try_split_regs(state, cur_id, block_pos[best_reg]) {
-                split_and_spill(state, cur_id, block_pos[best_reg]);
+            if !state.opts.partial_split
+                || !try_split_regs(state, cur_id, block_pos[best_reg], alloc)
+            {
+                split_and_spill(state, cur_id, block_pos[best_reg], alloc);
             }
         }
 
@@ -881,7 +910,7 @@ fn allocate_blocked_reg<F: Function>(
                         if reg == best_reg {
                             // spill it!
                             debug!("allocate_blocked_reg: split and spill active stolen reg");
-                            split_and_spill(state, int_id, start_pos);
+                            split_and_spill(state, int_id, start_pos, alloc);
                             break;
                         }
                     }
@@ -916,7 +945,11 @@ fn allocate_blocked_reg<F: Function>(
 ///
 /// Returns true if the original interval still lives in a register, after this function has been
 /// called.
-fn maybe_handle_safepoints<F: Function>(state: &mut State<F>, id: IntId) -> bool {
+fn maybe_handle_safepoints<'a, F: Function>(
+    state: &mut State<'_, 'a, F>,
+    id: IntId,
+    alloc: &Alloc<'a>,
+) -> bool {
     let int = state.intervals.get(id);
     if !int.ref_typed {
         return true;
@@ -939,14 +972,14 @@ fn maybe_handle_safepoints<F: Function>(state: &mut State<F>, id: IntId) -> bool
         }
 
         // The value is not redefined by the instruction, split and spill before the safepoint.
-        split_and_spill(state, id, InstPoint::new_use(sp_iix));
+        split_and_spill(state, id, InstPoint::new_use(sp_iix), alloc);
         return true;
     }
 
     // No use before the safepoint! Split the interval so a new child is put on the allocation
     // queue at its next use, and spill the interval.
     if let Some(nu) = next_use(&state.intervals.get(id), sp_def, &state.reg_uses) {
-        let child = split(state, id, nu);
+        let child = split(state, id, nu, alloc);
         state.insert_unhandled(child);
     }
 
@@ -1031,7 +1064,12 @@ fn next_pos(mut pos: InstPoint) -> InstPoint {
 /// In case of two-ways split (i.e. only place to split is precisely split_pos),
 /// returns the live interval id for the middle child, to be added back to the
 /// list of active/inactive intervals after iterating on these.
-fn split_and_spill<F: Function>(state: &mut State<F>, id: IntId, split_pos: InstPoint) {
+fn split_and_spill<'a, F: Function>(
+    state: &mut State<'_, 'a, F>,
+    id: IntId,
+    split_pos: InstPoint,
+    alloc: &Alloc<'a>,
+) {
     let child = match last_use(&state.intervals.get(id), split_pos, &state.reg_uses) {
         Some(last_use) => {
             debug!(
@@ -1046,7 +1084,7 @@ fn split_and_spill<F: Function>(state: &mut State<F>, id: IntId, split_pos: Inst
             // a position that's in the current interval.
             let optimal_pos = find_optimal_split_pos(state, id, min_pos, split_pos);
 
-            let child = split(state, id, optimal_pos);
+            let child = split(state, id, optimal_pos, alloc);
             state.spill(child);
             child
         }
@@ -1070,7 +1108,7 @@ fn split_and_spill<F: Function>(state: &mut State<F>, id: IntId, split_pos: Inst
                 "split spilled interval before next use @ {:?}",
                 next_use_pos
             );
-            let child = split(state, child, next_use_pos);
+            let child = split(state, child, next_use_pos, alloc);
             state.insert_unhandled(child);
         }
         None => {
@@ -1085,10 +1123,11 @@ fn split_and_spill<F: Function>(state: &mut State<F>, id: IntId, split_pos: Inst
 /// Try to find a (use) position where to split the interval until the next point at which it
 /// becomes unavailable, and put it back into the queue of intervals to allocate later on.  Returns
 /// true if it succeeded in finding such a position, false otherwise.
-fn try_split_regs<F: Function>(
-    state: &mut State<F>,
+fn try_split_regs<'a, F: Function>(
+    state: &mut State<'_, 'a, F>,
     id: IntId,
     available_until: InstPoint,
+    alloc: &Alloc<'a>,
 ) -> bool {
     state.stats.as_mut().map(|stats| stats.num_reg_splits += 1);
 
@@ -1124,7 +1163,7 @@ fn try_split_regs<F: Function>(
         pos
     };
 
-    let child = split(state, id, split_pos);
+    let child = split(state, id, split_pos, alloc);
     state.insert_unhandled(child);
 
     state
@@ -1144,7 +1183,12 @@ fn try_split_regs<F: Function>(
 /// The id of the new interval is returned, while the parent interval is mutated
 /// in place. The child interval starts after (including) at_pos.
 #[inline(never)]
-fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> IntId {
+fn split<'a, F: Function>(
+    state: &mut State<'_, 'a, F>,
+    id: IntId,
+    at_pos: InstPoint,
+    alloc: &Alloc<'a>,
+) -> IntId {
     debug!("split {:?} at {:?}", id, at_pos);
     trace!("interval: {}", state.intervals.get(id));
 
@@ -1182,7 +1226,7 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
 
     // Split the register mentions.
     let parent_mentions = state.intervals.get_mut(id).mentions_mut();
-    let index = parent_mentions.binary_search_by(|mention| {
+    let index = parent_mentions[..].binary_search_by(|mention| {
         // The comparator function returns the position of the argument compared to the target.
 
         // Search by index first.
@@ -1220,7 +1264,7 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
         Ok(index) => index,
         Err(index) => index,
     };
-    let mut child_mentions = MentionMap::with_capacity(parent_mentions.len() - index);
+    let mut child_mentions = BumpSmallVec::with_capacity(parent_mentions.len() - index, alloc);
     for mention in parent_mentions.iter().skip(index) {
         child_mentions.push(mention.clone());
     }
@@ -1265,7 +1309,7 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
             }
             i += 1;
         }
-        let child = parent_safepoints.iter().skip(i).cloned().collect();
+        let child = BumpSmallVec::from(parent_safepoints.iter().skip(i).cloned(), alloc);
         parent_safepoints.truncate(i);
         child
     };
@@ -1299,42 +1343,4 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
     }
 
     child_id
-}
-
-fn _build_mention_map(reg_uses: &RegUses) -> HashMap<Reg, MentionMap> {
-    // Maps reg to its mentions.
-    let mut reg_mentions: HashMap<Reg, MentionMap> = HashMap::default();
-
-    // Collect all the mentions.
-    for i in 0..reg_uses.num_insns() {
-        let iix = InstIx::new(i as u32);
-        let regsets = reg_uses.get_reg_sets_for_iix(iix);
-        debug_assert!(regsets.is_sanitized());
-
-        for reg in regsets.uses.iter() {
-            let mentions = reg_mentions.entry(*reg).or_default();
-            if mentions.is_empty() || mentions.last().unwrap().0 != iix {
-                mentions.push((iix, Mention::new()));
-            }
-            mentions.last_mut().unwrap().1.add_use();
-        }
-
-        for reg in regsets.mods.iter() {
-            let mentions = reg_mentions.entry(*reg).or_default();
-            if mentions.is_empty() || mentions.last().unwrap().0 != iix {
-                mentions.push((iix, Mention::new()));
-            }
-            mentions.last_mut().unwrap().1.add_mod();
-        }
-
-        for reg in regsets.defs.iter() {
-            let mentions = reg_mentions.entry(*reg).or_default();
-            if mentions.is_empty() || mentions.last().unwrap().0 != iix {
-                mentions.push((iix, Mention::new()));
-            }
-            mentions.last_mut().unwrap().1.add_def();
-        }
-    }
-
-    reg_mentions
 }

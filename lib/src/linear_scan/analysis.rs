@@ -13,8 +13,8 @@ use crate::{
     union_find::UnionFind,
     AnalysisError, Function, RealRegUniverse, RegClass, StackmapRequestInfo, TypedIxVec,
 };
+use crate::{Alloc, BumpSmallVec, BumpVec};
 use log::{debug, info, log_enabled, trace, Level};
-use smallvec::{smallvec, SmallVec};
 use std::{cmp::Ordering, fmt, mem};
 
 #[derive(Clone, Copy, PartialEq, Eq, Ord)]
@@ -43,15 +43,15 @@ pub(crate) struct BlockBoundary {
 }
 
 #[derive(Clone)]
-pub(crate) struct RangeFrag {
+pub(crate) struct RangeFrag<'a> {
     pub(crate) first: InstPoint,
     pub(crate) last: InstPoint,
-    pub(crate) mentions: MentionMap,
-    pub(crate) safepoints: Safepoints,
+    pub(crate) mentions: MentionMap<'a>,
+    pub(crate) safepoints: Safepoints<'a>,
     pub(crate) ref_typed: bool,
 }
 
-impl fmt::Debug for RangeFrag {
+impl<'a> fmt::Debug for RangeFrag<'a> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         let safepoint_str = if !self.safepoints.is_empty() {
             format!(
@@ -69,15 +69,15 @@ impl fmt::Debug for RangeFrag {
     }
 }
 
-impl RangeFrag {
+impl<'a> RangeFrag<'a> {
     fn new<F: Function>(
         func: &F,
         bix: BlockIx,
         first: InstPoint,
         last: InstPoint,
-        mentions: MentionMap,
+        mentions: MentionMap<'a>,
         ref_typed: bool,
-        safepoints: Safepoints,
+        safepoints: Safepoints<'a>,
     ) -> (Self, RangeFragMetrics) {
         debug_assert!(func.block_insns(bix).len() >= 1);
         debug_assert!(func.block_insns(bix).contains(first.iix()));
@@ -117,27 +117,28 @@ struct RangeFragMetrics {
     kind: RangeFragKind,
 }
 
-pub(crate) struct AnalysisInfo {
+pub(crate) struct AnalysisInfo<'a> {
     /// Control-flow graph information.
-    pub(crate) cfg: CFGInfo,
+    pub(crate) cfg: CFGInfo<'a>,
     /// The sanitized per-insn reg-use info.
-    pub(crate) reg_vecs_and_bounds: RegVecsAndBounds,
+    pub(crate) reg_vecs_and_bounds: RegVecsAndBounds<'a>,
     /// All the intervals, fixed or virtual.
-    pub(crate) intervals: Intervals,
+    pub(crate) intervals: Intervals<'a>,
     /// Liveins per block.
-    pub(crate) liveins: TypedIxVec<BlockIx, SparseSet<Reg>>,
+    pub(crate) liveins: TypedIxVec<'a, BlockIx, SparseSet<'a, Reg>>,
     /// Liveouts per block.
-    pub(crate) liveouts: TypedIxVec<BlockIx, SparseSet<Reg>>,
+    pub(crate) liveouts: TypedIxVec<'a, BlockIx, SparseSet<'a, Reg>>,
     /// Maps InstIxs to BlockIxs.
-    pub(crate) _inst_to_block_map: InstIxToBlockIxMap,
+    pub(crate) _inst_to_block_map: InstIxToBlockIxMap<'a>,
 }
 
 #[inline(never)]
-pub(crate) fn run<F: Function>(
+pub(crate) fn run<'a, F: Function>(
     func: &F,
     reg_universe: &RealRegUniverse,
     stackmap_request: Option<&StackmapRequestInfo>,
-) -> Result<AnalysisInfo, AnalysisError> {
+    alloc: &Alloc<'a>,
+) -> Result<AnalysisInfo<'a>, AnalysisError> {
     info!(
         "run_analysis: begin: {} blocks, {} insns",
         func.blocks().len(),
@@ -149,20 +150,20 @@ pub(crate) fn run<F: Function>(
     // this isn't really control-flow analysis, but needs to be done at some point.
 
     info!("  run_analysis: begin control flow analysis");
-    let cfg_info = CFGInfo::create(func)?;
-    let inst_to_block_map = InstIxToBlockIxMap::new(func);
+    let cfg_info = CFGInfo::create(func, alloc)?;
+    let inst_to_block_map = InstIxToBlockIxMap::new(func, alloc);
     info!("  run_analysis: end control flow analysis");
 
     info!("  run_analysis: begin data flow analysis");
 
     // See `get_sanitized_reg_uses_for_func` for the meaning of "sanitized".
-    let reg_vecs_and_bounds = get_sanitized_reg_uses_for_func(func, reg_universe)
+    let reg_vecs_and_bounds = get_sanitized_reg_uses_for_func(func, reg_universe, alloc)
         .map_err(|reg| AnalysisError::IllegalRealReg(reg))?;
     assert!(reg_vecs_and_bounds.is_sanitized());
 
     // Calculate block-local def/use sets.
     let (def_sets_per_block, use_sets_per_block) =
-        calc_def_and_use(func, &reg_vecs_and_bounds, &reg_universe);
+        calc_def_and_use(func, &reg_vecs_and_bounds, &reg_universe, alloc);
     debug_assert!(def_sets_per_block.len() == func.blocks().len() as u32);
     debug_assert!(use_sets_per_block.len() == func.blocks().len() as u32);
 
@@ -176,6 +177,7 @@ pub(crate) fn run<F: Function>(
         &use_sets_per_block,
         &cfg_info,
         &reg_universe,
+        alloc,
     );
     debug_assert!(livein_sets_per_block.len() == func.blocks().len() as u32);
     debug_assert!(liveout_sets_per_block.len() == func.blocks().len() as u32);
@@ -187,6 +189,7 @@ pub(crate) fn run<F: Function>(
             .into_iter()
             .map(|rreg| rreg.to_reg())
             .collect(),
+        alloc,
     );
     if !livein_sets_per_block[func.entry_block()].is_subset_of(&func_liveins) {
         let mut regs = livein_sets_per_block[func.entry_block()].clone();
@@ -201,6 +204,7 @@ pub(crate) fn run<F: Function>(
             .into_iter()
             .map(|rreg| rreg.to_reg())
             .collect(),
+        alloc,
     );
 
     for block in func.blocks() {
@@ -238,6 +242,7 @@ pub(crate) fn run<F: Function>(
         &reg_vecs_and_bounds,
         &livein_sets_per_block,
         &liveout_sets_per_block,
+        alloc,
     );
 
     let (mut fixed_intervals, mut virtual_intervals, vreg_to_vranges) = merge_range_frags(
@@ -249,6 +254,7 @@ pub(crate) fn run<F: Function>(
         &cfg_info,
         &vreg_classes,
         stackmap_request.is_some(),
+        alloc,
     )?;
     info!("  run_analysis: end liveness analysis");
 
@@ -260,8 +266,8 @@ pub(crate) fn run<F: Function>(
 
     if let Some(stackmap_request) = stackmap_request {
         // TODO depth-based is fine, using the plain depth would be sufficient too.
-        let estimator = DepthBasedFrequencies::new(func, &cfg_info);
-        let move_info = collect_move_info(func, &reg_vecs_and_bounds, &estimator);
+        let estimator = DepthBasedFrequencies::new(func, &cfg_info, alloc);
+        let move_info = collect_move_info(func, &reg_vecs_and_bounds, &estimator, alloc);
 
         do_reftype_analysis(
             &move_info,
@@ -270,6 +276,7 @@ pub(crate) fn run<F: Function>(
             &vreg_to_vranges,
             &frag_env,
             stackmap_request,
+            alloc,
         );
     }
 
@@ -296,14 +303,14 @@ enum RangeId {
     Virtual(usize),
 }
 
-struct LsraReftypeAnalysis<'a> {
-    fixed_intervals: &'a mut [FixedInterval],
-    virtual_intervals: &'a mut [VirtualInterval],
-    vreg_to_vranges: &'a VirtualRegToRanges,
-    frag_env: &'a [RangeFrag],
+struct LsraReftypeAnalysis<'a, 'b> {
+    fixed_intervals: &'b mut [FixedInterval<'a>],
+    virtual_intervals: &'b mut [VirtualInterval<'a>],
+    vreg_to_vranges: &'b VirtualRegToRanges<'a>,
+    frag_env: &'b [RangeFrag<'a>],
 }
 
-impl<'a> ReftypeAnalysis for LsraReftypeAnalysis<'a> {
+impl<'a, 'b> ReftypeAnalysis for LsraReftypeAnalysis<'a, 'b> {
     type RangeId = RangeId;
 
     fn find_range_id_for_reg(&self, pt: InstPoint, reg: Reg) -> Self::RangeId {
@@ -316,8 +323,7 @@ impl<'a> ReftypeAnalysis for LsraReftypeAnalysis<'a> {
         let vranges = &self.vreg_to_vranges[vreg.get_index()];
         for vrange in vranges {
             // If any fragment in the range contains the point, then the whole range must be reffy.
-            let found = vrange
-                .frag_ixs
+            let found = vrange.frag_ixs[..]
                 .binary_search_by(|&ix| {
                     let frag = &self.frag_env[ix.get() as usize];
                     if pt < frag.first {
@@ -337,7 +343,7 @@ impl<'a> ReftypeAnalysis for LsraReftypeAnalysis<'a> {
         panic!("should have found a (vreg; vrange) containing the move!");
     }
 
-    fn insert_reffy_ranges(&self, vreg: VirtualReg, set: &mut SparseSet<Self::RangeId>) {
+    fn insert_reffy_ranges<'c>(&self, vreg: VirtualReg, set: &mut SparseSet<'c, Self::RangeId>) {
         for vrange in &self.vreg_to_vranges[vreg.get_index()] {
             debug!(
                 "range {:?} is reffy due to reffy vreg {:?}",
@@ -370,13 +376,14 @@ impl<'a> ReftypeAnalysis for LsraReftypeAnalysis<'a> {
 /// Given intervals initially marked as reffy or not according to their appearance in the
 /// reftyped_vregs array, computes the transitive closure of reftypeness over the set of moves
 /// present in the program.
-fn do_reftype_analysis(
+fn do_reftype_analysis<'a, 'b>(
     move_info: &MoveInfo,
-    fixed_intervals: &mut [FixedInterval],
-    virtual_intervals: &mut [VirtualInterval],
-    vreg_to_vranges: &VirtualRegToRanges,
-    frag_env: &[RangeFrag],
+    fixed_intervals: &'b mut [FixedInterval<'a>],
+    virtual_intervals: &'b mut [VirtualInterval<'a>],
+    vreg_to_vranges: &'b VirtualRegToRanges<'a>,
+    frag_env: &'b [RangeFrag<'a>],
     stackmap_request: &StackmapRequestInfo,
+    alloc: &Alloc<'a>,
 ) {
     let reftyped_vregs = &stackmap_request.reftyped_vregs;
     let reftype_class = stackmap_request.reftype_class;
@@ -386,7 +393,13 @@ fn do_reftype_analysis(
         vreg_to_vranges,
         frag_env,
     };
-    core_reftypes_analysis(&mut analysis, move_info, reftype_class, reftyped_vregs);
+    core_reftypes_analysis(
+        &mut analysis,
+        move_info,
+        reftype_class,
+        reftyped_vregs,
+        alloc,
+    );
 }
 
 /// Calculate all the RangeFrags for `bix`.  Add them to `out_frags` and
@@ -394,22 +407,23 @@ fn do_reftype_analysis(
 /// associated RangeFragIxs, segregated by Reg.  `bix`, `livein`, `liveout` and
 /// `rvb` are expected to be valid in the context of the Func `f` (duh!).
 #[inline(never)]
-fn get_range_frags_for_block<F: Function>(
+fn get_range_frags_for_block<'a, F: Function>(
     func: &F,
-    rvb: &RegVecsAndBounds,
+    rvb: &RegVecsAndBounds<'a>,
     reg_universe: &RealRegUniverse,
-    vreg_classes: &Vec<RegClass>,
+    vreg_classes: &[RegClass],
     safepoints: Option<&[InstIx]>,
     bix: BlockIx,
-    livein: &SparseSet<Reg>,
-    liveout: &SparseSet<Reg>,
+    livein: &SparseSet<'a, Reg>,
+    liveout: &SparseSet<'a, Reg>,
     // Temporary state reusable across function calls.
-    visited: &mut Vec<u32>,
-    state: &mut Vec</*rreg index, then vreg index, */ Option<RangeFrag>>,
+    visited: &mut BumpVec<'a, u32>,
+    state: &mut BumpVec<'a, /*rreg index, then vreg index, */ Option<RangeFrag<'a>>>,
     // Effectively results.
-    out_map: &mut Vec<SmallVec<[RangeFragIx; 8]>>,
-    out_frags: &mut Vec<RangeFrag>,
-    out_frag_metrics: &mut Vec<RangeFragMetrics>,
+    out_map: &mut BumpVec<'a, BumpVec<'a, RangeFragIx>>,
+    out_frags: &mut BumpVec<'a, RangeFrag<'a>>,
+    out_frag_metrics: &mut BumpVec<'a, RangeFragMetrics>,
+    alloc: &Alloc<'a>,
 ) {
     // Iterate to the next safepoint contained in this block.
     let first_sp_ix = {
@@ -427,7 +441,7 @@ fn get_range_frags_for_block<F: Function>(
     };
 
     let mut emit_range_frag =
-        |r: Reg, mut frag: RangeFrag, frag_metrics: RangeFragMetrics, num_real_regs: u32| {
+        |r: Reg, mut frag: RangeFrag<'a>, frag_metrics: RangeFragMetrics, num_real_regs: u32| {
             // Make a list of all the safepoints present in this range.
             if let (Some(ref safepoints), Some(first_sp_ix)) = (safepoints, first_sp_ix) {
                 let mut sp_ix = first_sp_ix;
@@ -469,10 +483,10 @@ fn get_range_frags_for_block<F: Function>(
         let reg_state_ix = reg_to_reg_ix(num_real_regs, *reg) as usize;
         debug_assert!(state[reg_state_ix].is_none());
         state[reg_state_ix] = Some(RangeFrag {
-            mentions: MentionMap::new(),
+            mentions: BumpSmallVec::new(alloc),
             first: first_pt_in_block,
             last: first_pt_in_block,
-            safepoints: Default::default(),
+            safepoints: BumpSmallVec::new(alloc),
             ref_typed: false,
         });
         visited.push(reg_state_ix as u32);
@@ -553,9 +567,12 @@ fn get_range_frags_for_block<F: Function>(
                     state[reg_state_ix] = Some(RangeFrag {
                         first: new_pt,
                         last: new_pt,
-                        mentions: smallvec![(inst_ix, mention_set)],
+                        mentions: BumpSmallVec::from(
+                            std::iter::once((inst_ix, mention_set)),
+                            alloc,
+                        ),
                         ref_typed: false,
-                        safepoints: smallvec![],
+                        safepoints: BumpSmallVec::new(alloc),
                     })
                 }
 
@@ -569,8 +586,8 @@ fn get_range_frags_for_block<F: Function>(
                     ref mut safepoints,
                 }) => {
                     // Steal the mentions and replace the mutable ref by an empty vector for reuse.
-                    let stolen_mentions = mem::replace(mentions, MentionMap::new());
-                    let stolen_safepoints = mem::replace(safepoints, Default::default());
+                    let stolen_mentions = mem::replace(mentions, BumpSmallVec::new(alloc));
+                    let stolen_safepoints = mem::replace(safepoints, BumpSmallVec::new(alloc));
 
                     let (frag, frag_metrics) = RangeFrag::new(
                         func,
@@ -628,9 +645,9 @@ fn get_range_frags_for_block<F: Function>(
                 bix,
                 prev_frag.first,
                 prev_frag.last,
-                mem::replace(&mut prev_frag.mentions, MentionMap::new()),
+                mem::replace(&mut prev_frag.mentions, BumpSmallVec::new(alloc)),
                 prev_frag.ref_typed,
-                mem::replace(&mut prev_frag.safepoints, Default::default()),
+                mem::replace(&mut prev_frag.safepoints, BumpSmallVec::new(alloc)),
             );
             emit_range_frag(r, frag, frag_metrics, num_real_regs);
             state[*r_state_ix as usize] = None;
@@ -639,25 +656,27 @@ fn get_range_frags_for_block<F: Function>(
 }
 
 #[inline(never)]
-fn get_range_frags<F: Function>(
+fn get_range_frags<'a, F: Function>(
     func: &F,
     reg_universe: &RealRegUniverse,
     safepoints: Option<&[InstIx]>,
-    rvb: &RegVecsAndBounds,
-    liveins: &TypedIxVec<BlockIx, SparseSet<Reg>>,
-    liveouts: &TypedIxVec<BlockIx, SparseSet<Reg>>,
+    rvb: &RegVecsAndBounds<'a>,
+    liveins: &TypedIxVec<'a, BlockIx, SparseSet<'a, Reg>>,
+    liveouts: &TypedIxVec<'a, BlockIx, SparseSet<'a, Reg>>,
+    alloc: &Alloc<'a>,
 ) -> (
-    Vec</*rreg index, then vreg index, */ SmallVec<[RangeFragIx; 8]>>,
-    Vec<RangeFrag>,
-    Vec<RangeFragMetrics>,
-    Vec</*vreg index,*/ RegClass>,
+    BumpVec<'a, /*rreg index, then vreg index, */ BumpVec<'a, RangeFragIx>>,
+    BumpVec<'a, RangeFrag<'a>>,
+    BumpVec<'a, RangeFragMetrics>,
+    BumpVec<'a, /*vreg index,*/ RegClass>,
 ) {
     info!("    get_range_frags: begin");
     debug_assert!(liveins.len() == func.blocks().len() as u32);
     debug_assert!(liveouts.len() == func.blocks().len() as u32);
     debug_assert!(rvb.is_sanitized());
 
-    let mut vreg_classes = vec![RegClass::INVALID; func.get_num_vregs()];
+    let mut vreg_classes =
+        alloc.collect(std::iter::repeat(RegClass::INVALID).take(func.get_num_vregs()));
     for r in rvb
         .vecs
         .uses
@@ -682,18 +701,21 @@ fn get_range_frags<F: Function>(
     let num_regs = num_real_regs + num_virtual_regs;
 
     // Reused by the function below.
-    let mut tmp_state = vec![None; num_regs];
-    let mut tmp_visited = Vec::with_capacity(32);
+    let mut tmp_state = alloc.collect(std::iter::repeat(None).take(num_regs));
+    let mut tmp_visited = alloc.vec(32);
 
-    let mut result_map = vec![SmallVec::new(); num_regs];
-    let mut result_frags = Vec::new();
-    let mut result_frag_metrics = Vec::new();
+    let mut result_map = alloc.vec(num_regs);
+    for _ in 0..num_regs {
+        result_map.push(alloc.vec(0));
+    }
+    let mut result_frags = alloc.vec(16);
+    let mut result_frag_metrics = alloc.vec(16);
     for bix in func.blocks() {
         get_range_frags_for_block(
             func,
             &rvb,
             reg_universe,
-            &vreg_classes,
+            &vreg_classes[..],
             safepoints,
             bix,
             &liveins[bix],
@@ -703,6 +725,7 @@ fn get_range_frags<F: Function>(
             &mut result_map,
             &mut result_frags,
             &mut result_frag_metrics,
+            alloc,
         );
     }
 
@@ -744,24 +767,32 @@ fn get_range_frags<F: Function>(
 }
 
 #[derive(Clone)]
-struct SimplifiedVirtualRange {
+struct SimplifiedVirtualRange<'a> {
     int: IntId,
-    frag_ixs: SmallVec<[RangeFragIx; 4]>,
+    frag_ixs: BumpSmallVec<'a, [RangeFragIx; 4]>,
 }
 
-type VirtualRegToRanges = Vec<SmallVec<[SimplifiedVirtualRange; 4]>>;
+type VirtualRegToRanges<'a> = BumpVec<'a, BumpVec<'a, SimplifiedVirtualRange<'a>>>;
 
 #[inline(never)]
-fn merge_range_frags<F: Function>(
+fn merge_range_frags<'a, F: Function>(
     func: &F,
     reg_universe: &RealRegUniverse,
-    frag_ix_vec_per_reg: &[SmallVec<[RangeFragIx; 8]>],
-    frag_env: &mut Vec<RangeFrag>,
-    frag_metrics_env: &Vec<RangeFragMetrics>,
-    cfg_info: &CFGInfo,
-    vreg_classes: &Vec</*vreg index,*/ RegClass>,
+    frag_ix_vec_per_reg: &[BumpVec<'a, RangeFragIx>],
+    frag_env: &mut BumpVec<'a, RangeFrag<'a>>,
+    frag_metrics_env: &[RangeFragMetrics],
+    cfg_info: &CFGInfo<'a>,
+    vreg_classes: &[RegClass],
     wants_stackmaps: bool,
-) -> Result<(Vec<FixedInterval>, Vec<VirtualInterval>, VirtualRegToRanges), AnalysisError> {
+    alloc: &Alloc<'a>,
+) -> Result<
+    (
+        BumpVec<'a, FixedInterval<'a>>,
+        BumpVec<'a, VirtualInterval<'a>>,
+        VirtualRegToRanges<'a>,
+    ),
+    AnalysisError,
+> {
     info!("    merge_range_frags: begin");
     if log_enabled!(Level::Info) {
         let mut stats_num_total_incoming_frags = 0;
@@ -778,28 +809,28 @@ fn merge_range_frags<F: Function>(
 
     debug_assert!(frag_env.len() == frag_metrics_env.len());
 
-    let mut vreg_to_vranges: VirtualRegToRanges = vec![
-        SmallVec::<[SimplifiedVirtualRange; 4]>::new(
-        );
-        if wants_stackmaps {
-            func.get_num_vregs()
-        } else {
-            0
-        }
-    ];
+    let vreg_to_ranges_len = if wants_stackmaps {
+        func.get_num_vregs()
+    } else {
+        0
+    };
+    let mut vreg_to_vranges = alloc.vec(vreg_to_ranges_len);
+    for _ in 0..vreg_to_ranges_len {
+        vreg_to_vranges.push(alloc.vec(0));
+    }
 
     // Prefill fixed intervals, one per real register.
-    let mut result_fixed = Vec::with_capacity(reg_universe.regs.len() as usize);
+    let mut result_fixed = alloc.vec(reg_universe.regs.len() as usize);
     for rreg in reg_universe.regs.iter() {
         result_fixed.push(FixedInterval {
             reg: rreg.0,
-            frags: Vec::new(),
+            frags: alloc.vec(0),
         });
     }
 
-    let mut result_virtual = Vec::new();
+    let mut result_virtual = alloc.vec(16);
 
-    let mut triples = Vec::<(RangeFragIx, RangeFragKind, BlockIx)>::new();
+    let mut triples = alloc.vec(16);
 
     // BEGIN per_reg_loop
     for (reg_ix, all_frag_ixs_for_reg) in frag_ix_vec_per_reg.iter().enumerate() {
@@ -824,6 +855,7 @@ fn merge_range_frags<F: Function>(
                 all_frag_ixs_for_reg,
                 &frag_metrics_env,
                 frag_env,
+                alloc,
             )?;
             continue;
         }
@@ -851,6 +883,7 @@ fn merge_range_frags<F: Function>(
                     &[*fix],
                     &frag_metrics_env,
                     frag_env,
+                    alloc,
                 )?;
                 continue;
             }
@@ -887,7 +920,7 @@ fn merge_range_frags<F: Function>(
         // are mutually redundant, since if two blocks are connected by a live
         // flow from one to the other, then they are also connected in the other
         // direction.  Hence checking one of the directions is enough.
-        let mut eclasses_uf = UnionFind::<usize>::new(triples_len);
+        let mut eclasses_uf = UnionFind::<usize>::new(triples_len, alloc);
 
         // We have two schemes for group merging, one of which is N^2 in the
         // length of triples, the other is N-log-N, but with higher constant
@@ -1000,10 +1033,10 @@ fn merge_range_frags<F: Function>(
         // Now `eclasses_uf` contains the results of the merging-search.  Visit each of its
         // equivalence classes in turn, and convert each into a virtual or real live range as
         // appropriate.
-        let eclasses = eclasses_uf.get_equiv_classes();
+        let eclasses = eclasses_uf.get_equiv_classes(alloc);
         for leader_triple_ix in eclasses.equiv_class_leaders_iter() {
             // `leader_triple_ix` is an eclass leader.  Enumerate the whole eclass.
-            let mut frag_ixs = SmallVec::<[RangeFragIx; 4]>::new();
+            let mut frag_ixs = alloc.vec(4);
             for triple_ix in eclasses.equiv_class_elems_iter(leader_triple_ix) {
                 frag_ixs.push(triples[triple_ix].0 /*first field is frag ix*/);
             }
@@ -1016,6 +1049,7 @@ fn merge_range_frags<F: Function>(
                 &frag_ixs,
                 &frag_metrics_env,
                 frag_env,
+                alloc,
             )?;
         }
         // END merge `all_frag_ixs_for_reg` entries as much as possible
@@ -1025,9 +1059,7 @@ fn merge_range_frags<F: Function>(
     // on when doing the reftype analysis.
     for entry in vreg_to_vranges.iter_mut() {
         for vrange in entry {
-            vrange
-                .frag_ixs
-                .sort_unstable_by_key(|&fix| frag_env[fix.get() as usize].first);
+            vrange.frag_ixs[..].sort_unstable_by_key(|&fix| frag_env[fix.get() as usize].first);
         }
     }
 
@@ -1037,15 +1069,16 @@ fn merge_range_frags<F: Function>(
 }
 
 #[inline(never)]
-fn flush_interval(
-    result_real: &mut Vec<FixedInterval>,
-    result_virtual: &mut Vec<VirtualInterval>,
-    vreg_to_vranges: &mut VirtualRegToRanges,
+fn flush_interval<'a>(
+    result_real: &mut BumpVec<'a, FixedInterval<'a>>,
+    result_virtual: &mut BumpVec<'a, VirtualInterval<'a>>,
+    vreg_to_vranges: &mut VirtualRegToRanges<'a>,
     wants_stackmaps: bool,
     reg: Reg,
     frag_ixs: &[RangeFragIx],
     metrics: &[RangeFragMetrics],
-    frags: &mut Vec<RangeFrag>,
+    frags: &mut BumpVec<'a, RangeFrag<'a>>,
+    alloc: &Alloc<'a>,
 ) -> Result<(), AnalysisError> {
     if reg.is_real() {
         // Append all the RangeFrags to this fixed interval. They'll get sorted later.
@@ -1056,9 +1089,9 @@ fn flush_interval(
             fixed_int.frags.push(RangeFrag {
                 first: frag.first,
                 last: frag.last,
-                mentions: mem::replace(&mut frag.mentions, MentionMap::new()),
+                mentions: mem::replace(&mut frag.mentions, BumpSmallVec::new(alloc)),
                 ref_typed: false,
-                safepoints: Default::default(),
+                safepoints: BumpSmallVec::new(alloc),
             })
         }
         return Ok(());
@@ -1079,21 +1112,21 @@ fn flush_interval(
         // Merge all the register mentions and safepoints together.
 
         // TODO rework this!
-        let mut mentions = MentionMap::with_capacity(capacity);
-        let mut safepoints: Safepoints = Default::default();
+        let mut mentions = MentionMap::with_capacity(capacity, alloc);
+        let mut safepoints: Safepoints = BumpSmallVec::new(alloc);
         for frag in frag_ixs.iter().map(|fix| &frags[fix.get() as usize]) {
             mentions.extend(frag.mentions.iter().cloned());
             safepoints.extend(frag.safepoints.iter().cloned());
             start = InstPoint::min(start, frag.first);
             end = InstPoint::max(end, frag.last);
         }
-        safepoints.sort_unstable_by_key(|tuple| tuple.0);
-        mentions.sort_unstable_by_key(|tuple| tuple.0);
+        safepoints[..].sort_unstable_by_key(|tuple| tuple.0);
+        mentions[..].sort_unstable_by_key(|tuple| tuple.0);
 
         // Merge mention set that are at the same instruction.
         let mut s = 0;
         let mut e;
-        let mut to_remove = Vec::new();
+        let mut to_remove = alloc.vec(0);
         while s < mentions.len() {
             e = s;
             while e + 1 < mentions.len() && mentions[s].0 == mentions[e + 1].0 {
@@ -1127,7 +1160,7 @@ fn flush_interval(
 
         // Retrieve all the block boundary information from the range metrics.
 
-        let mut block_boundaries = Vec::new();
+        let mut block_boundaries = alloc.vec(2);
         for fix in frag_ixs.iter() {
             let metric = &metrics[fix.get() as usize];
             let bix = metric.bix;
@@ -1193,7 +1226,7 @@ fn flush_interval(
     if wants_stackmaps {
         vreg_to_vranges[reg.get_index()].push(SimplifiedVirtualRange {
             int: id,
-            frag_ixs: frag_ixs.into_iter().cloned().collect(),
+            frag_ixs: BumpSmallVec::from(frag_ixs.into_iter().cloned(), alloc),
         })
     }
 

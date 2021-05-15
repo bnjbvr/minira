@@ -8,6 +8,7 @@ use crate::{
     StackmapRequestInfo,
 };
 use crate::{reg_maps::VrangeRegUsageMapper, Function, RegAllocError};
+use crate::{Alloc, BumpVec};
 use log::trace;
 
 use std::result::Result;
@@ -198,7 +199,7 @@ impl InstExtPoint {
 }
 
 // So, finally, we can specify what we want: an instruction to insert, and a place to insert it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct InstToInsertAndExtPoint {
     pub(crate) inst: InstToInsert,
     pub(crate) iep: InstExtPoint,
@@ -217,15 +218,16 @@ impl InstToInsertAndExtPoint {
 // algorithm wants removed, by nop-ing them out.
 
 #[inline(never)]
-fn map_vregs_to_rregs<F: Function>(
+fn map_vregs_to_rregs<'a, F: Function>(
     func: &mut F,
-    frag_map: Vec<(RangeFrag, VirtualReg, RealReg)>,
-    insts_to_add: &Vec<InstToInsertAndExtPoint>,
-    iixs_to_nop_out: &Vec<InstIx>,
+    frag_map: &[(RangeFrag, VirtualReg, RealReg)],
+    insts_to_add: &[InstToInsertAndExtPoint],
+    iixs_to_nop_out: &[InstIx],
     reg_universe: &RealRegUniverse,
     use_checker: bool,
     stackmap_request: Option<&StackmapRequestInfo>,
-    stackmaps: &[Vec<SpillSlot>],
+    stackmaps: &[BumpVec<'a, SpillSlot>],
+    alloc: &Alloc<'a>,
 ) -> Result<(), CheckerErrors> {
     // Set up checker state, if indicated by our configuration.
     let mut checker: Option<CheckerContext> = None;
@@ -238,6 +240,7 @@ fn map_vregs_to_rregs<F: Function>(
             reg_universe,
             insts_to_add,
             stackmap_info,
+            alloc,
         ));
         insn_blocks.resize(func.insns().len(), BlockIx::new(0));
         for block_ix in func.blocks() {
@@ -249,14 +252,14 @@ fn map_vregs_to_rregs<F: Function>(
 
     // Sort the insn nop-out index list, so we can advance through it
     // during the main loop.
-    let mut iixs_to_nop_out = iixs_to_nop_out.clone();
+    let mut iixs_to_nop_out = alloc.collect(iixs_to_nop_out.iter().cloned());
     iixs_to_nop_out.sort();
 
     // Make two copies of the fragment mapping, one sorted by the fragment start
     // points (just the InstIx numbers, ignoring the Point), and one sorted by
     // fragment end points.
-    let mut frag_maps_by_start = frag_map.clone();
-    let mut frag_maps_by_end = frag_map;
+    let mut frag_maps_by_start = alloc.collect(frag_map.iter().cloned());
+    let mut frag_maps_by_end = alloc.collect(frag_map.iter().cloned());
 
     // -------- Edit the instruction stream --------
     frag_maps_by_start.sort_unstable_by(|(frag, _, _), (other_frag, _, _)| {
@@ -522,21 +525,22 @@ fn map_vregs_to_rregs<F: Function>(
 // algorithm has asked us to add.
 
 #[inline(never)]
-pub(crate) fn add_spills_reloads_and_moves<F: Function>(
+pub(crate) fn add_spills_reloads_and_moves<'a, F: Function>(
     func: &mut F,
     safepoint_insns: Option<&[InstIx]>,
-    mut insts_to_add: Vec<InstToInsertAndExtPoint>,
+    insts_to_add: &[InstToInsertAndExtPoint],
+    alloc: &Alloc<'a>,
 ) -> Result<
     (
         Vec<F::Inst>,
-        TypedIxVec<BlockIx, InstIx>,
-        TypedIxVec<InstIx, InstIx>,
-        Vec<InstIx>,
+        TypedIxVec<'a, BlockIx, InstIx>,
+        TypedIxVec<'a, InstIx, InstIx>,
+        BumpVec<'a, InstIx>,
     ),
     String,
 > {
-    let empty_safepoint_insts = Vec::new();
-    let safepoint_insns = safepoint_insns.unwrap_or(&empty_safepoint_insts);
+    let mut insts_to_add = alloc.collect(insts_to_add.iter().cloned());
+    let safepoint_insns = safepoint_insns.map(|v| &v[..]).unwrap_or(&[]);
 
     // Construct the final code by interleaving the mapped code with the the
     // spills, reloads and moves that we have been requested to insert.  To do
@@ -559,16 +563,16 @@ pub(crate) fn add_spills_reloads_and_moves<F: Function>(
     let mut cur_inst_to_add = 0;
     let mut cur_block = BlockIx::new(0);
 
-    let mut insns: Vec<F::Inst> = vec![];
-    let mut target_map: TypedIxVec<BlockIx, InstIx> = TypedIxVec::new();
+    let mut insns = vec![];
+    let mut target_map: TypedIxVec<BlockIx, InstIx> = TypedIxVec::new(alloc);
 
-    let mut new_to_old_insn_map: TypedIxVec<InstIx, InstIx> = TypedIxVec::new();
+    let mut new_to_old_insn_map: TypedIxVec<InstIx, InstIx> = TypedIxVec::new(alloc);
     target_map.reserve(func.blocks().len());
     new_to_old_insn_map.reserve(func.insn_indices().len() + insts_to_add.len());
 
     // Index in `safepoint_insns` of the next safepoint insn we will encounter
     let mut next_safepoint_insn_index = 0;
-    let mut new_safepoint_insns = Vec::<InstIx>::new();
+    let mut new_safepoint_insns = alloc.vec(safepoint_insns.len());
     new_safepoint_insns.reserve(safepoint_insns.len());
 
     for iix in func.insn_indices() {
@@ -633,33 +637,35 @@ pub(crate) fn add_spills_reloads_and_moves<F: Function>(
 // Main function
 
 #[inline(never)]
-pub(crate) fn edit_inst_stream<F: Function>(
+pub(crate) fn edit_inst_stream<'a, F: Function>(
     func: &mut F,
-    insts_to_add: Vec<InstToInsertAndExtPoint>,
-    iixs_to_nop_out: &Vec<InstIx>,
-    frag_map: Vec<(RangeFrag, VirtualReg, RealReg)>,
+    insts_to_add: &[InstToInsertAndExtPoint],
+    iixs_to_nop_out: &[InstIx],
+    frag_map: &[(RangeFrag, VirtualReg, RealReg)],
     reg_universe: &RealRegUniverse,
     use_checker: bool,
     stackmap_request: Option<&StackmapRequestInfo>,
-    stackmaps: &[Vec<SpillSlot>],
+    stackmaps: &[BumpVec<'a, SpillSlot>],
+    alloc: &Alloc<'a>,
 ) -> Result<
     (
         Vec<F::Inst>,
-        TypedIxVec<BlockIx, InstIx>,
-        TypedIxVec<InstIx, InstIx>,
-        Vec<InstIx>,
+        TypedIxVec<'a, BlockIx, InstIx>,
+        TypedIxVec<'a, InstIx, InstIx>,
+        BumpVec<'a, InstIx>,
     ),
     RegAllocError,
 > {
     map_vregs_to_rregs(
         func,
         frag_map,
-        &insts_to_add,
+        insts_to_add,
         iixs_to_nop_out,
         reg_universe,
         use_checker,
         stackmap_request,
         stackmaps,
+        alloc,
     )
     .map_err(|e| RegAllocError::RegChecker(e))?;
 
@@ -667,6 +673,7 @@ pub(crate) fn edit_inst_stream<F: Function>(
         func,
         stackmap_request.map(|request| request.safepoint_insns.as_slice()),
         insts_to_add,
+        alloc,
     )
     .map_err(|e| RegAllocError::Other(e))
 }

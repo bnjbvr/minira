@@ -49,8 +49,15 @@ fuzz_target!(|func: ir::Func| {
     };
 
     let sri = func.get_stackmap_request();
-    let ra_result =
-        regalloc::allocate_registers_with_opts(&mut func, &reg_universe, sri.as_ref(), opts);
+    let bump = regalloc::Bump::new();
+    let alloc = regalloc::Alloc(&bump);
+    let ra_result = regalloc::allocate_registers_with_opts(
+        &mut func,
+        &reg_universe,
+        sri.as_ref(),
+        opts,
+        &alloc,
+    );
 
     match ra_result {
         Ok(result) => {

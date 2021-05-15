@@ -29,7 +29,7 @@ impl From<io::Error> for ParseError {
 
 pub type ParseResult<T> = Result<T, ParseError>;
 
-pub fn parse_file(path: PathBuf) -> ParseResult<Func> {
+pub fn parse_file<'a>(path: PathBuf) -> ParseResult<Func> {
     let basename = path.file_stem().unwrap().to_str().unwrap().to_string();
     let mut file = File::open(path)?;
     let mut content = String::new();
@@ -461,7 +461,7 @@ pub fn parse_content(func_name: &str, content: &str) -> ParseResult<Func> {
 
     // Look for blocks (name already contains the name of the first block).
     loop {
-        let mut insts = Vec::new();
+        let mut insts = vec![];
         let block_name = next_block_name;
 
         // Look for instructions.

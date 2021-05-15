@@ -21,7 +21,7 @@ impl<'rru> Context<'rru> {
         Self {
             num_vregs: func.num_virtual_regs as usize,
             real_reg_universe,
-            num_blocks: func.blocks.len(),
+            num_blocks: func.blocks.len() as u32,
             vreg_types: HashMap::new(),
             used_regs: HashSet::new(),
         }
@@ -99,19 +99,19 @@ pub fn validate(func: &Func, real_reg_universe: &RealRegUniverse) -> Result<(), 
         }
     }
 
-    if func.blocks[BlockIx::new(0)].start.get() != 0 {
+    if func.blocks[0].start.get() != 0 {
         return Err(format!("first block must start at first instruction"));
     }
 
-    let last_block = &func.blocks[BlockIx::new(func.blocks.len() - 1)];
-    if func.insns.len() != last_block.start.get() + last_block.len {
+    let last_block = &func.blocks[func.blocks.len() - 1];
+    if func.insns.len() as u32 != last_block.start.get() + last_block.len {
         return Err(format!("unused instructions"));
     }
 
     // Check that blocks are ordered in increasing block start.
     for i in 1..func.blocks.len() {
-        let prev = BlockIx::new(i - 1);
-        let cur = BlockIx::new(i);
+        let prev = i - 1;
+        let cur = i;
 
         let prev_block = &func.blocks[prev];
         if prev_block.start >= func.blocks[cur].start {
@@ -134,14 +134,14 @@ pub fn validate(func: &Func, real_reg_universe: &RealRegUniverse) -> Result<(), 
             return Err("too many block instructions".into());
         }
         for i in b.start.dotdot(b.start.plus(b.len)) {
-            if i.get() >= func.insns.len() {
+            if i.get() >= func.insns.len() as u32 {
                 return Err(format!(
                     "invalid instruction number {:?} in block {}",
                     i, b.name
                 ));
             }
 
-            let inst = &func.insns[i];
+            let inst = &func.insns[i.get() as usize];
 
             if !inst.is_user() {
                 return Err(format!(
@@ -177,6 +177,8 @@ pub fn validate(func: &Func, real_reg_universe: &RealRegUniverse) -> Result<(), 
         }
     }
 
+    let bump = Bump::new();
+    let alloc = Alloc(&bump);
     if let Err(err) = regalloc::analysis_main::run_analysis(
         func,
         real_reg_universe,
@@ -187,6 +189,7 @@ pub fn validate(func: &Func, real_reg_universe: &RealRegUniverse) -> Result<(), 
         /*client_wants_stackmaps=*/ true,
         /*reftype_class=*/ RegClass::I64,
         /*reftyped_vregs=*/ &vec![],
+        &alloc,
     ) {
         return Err(err.to_string());
     }

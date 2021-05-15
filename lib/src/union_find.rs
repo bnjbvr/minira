@@ -4,6 +4,7 @@
 //! An implementation of a fast union-find implementation for "T: ToFromU32" items
 //! in some dense range [0, N-1].
 
+use crate::{Alloc, BumpVec};
 use std::marker::PhantomData;
 
 //=============================================================================
@@ -59,7 +60,7 @@ impl ToFromU32 for u32 {
 // construct it is home-grown; although I'm sure the same idea has been
 // implemented many times before.
 
-pub struct UnionFind<T: ToFromU32> {
+pub struct UnionFind<'a, T: ToFromU32> {
     // These are the trees that we are building.  A value that is negative means
     // that this node is a tree root, and the negation of its value is the size
     // of the tree.  A value that is positive (which must be in the range [0,
@@ -70,7 +71,7 @@ pub struct UnionFind<T: ToFromU32> {
     // be supported.  Doesn't seem like much of a limitation in practice, given
     // that all of this allocator's data structures are limited to 2^32 entries.
     /*priv*/
-    parent_or_size: Vec<i32>,
+    parent_or_size: BumpVec<'a, i32>,
 
     // Keep the typechecker happy
     /*priv*/
@@ -80,13 +81,13 @@ pub struct UnionFind<T: ToFromU32> {
 /*priv*/
 const UF_MAX_SIZE: u32 = 0x7FFF_FFF0;
 
-impl<T: ToFromU32> UnionFind<T> {
-    pub fn new(size: usize) -> Self {
+impl<'a, T: ToFromU32> UnionFind<'a, T> {
+    pub fn new(size: usize, alloc: &Alloc<'a>) -> Self {
         // Test a slightly conservative limit to avoid any off-by-one errors.
         if size > UF_MAX_SIZE as usize {
             panic!("UnionFind::new: too many elements; max = 2^31 - 16.");
         }
-        let mut parent_or_size = Vec::<i32>::new();
+        let mut parent_or_size = alloc.vec(size);
         parent_or_size.resize(size, -1);
         Self {
             parent_or_size,
@@ -254,16 +255,16 @@ struct LLElem {
     tail: u32,
 }
 
-pub struct UnionFindEquivClasses<T: ToFromU32> {
+pub struct UnionFindEquivClasses<'a, T: ToFromU32> {
     // Linked list start "pointers".  Has .len() == universe size.  Entries must
     // not be UFEC_NULL since each element is at least a member of its own
     // equivalence class.
     /*priv*/
-    heads: Vec<u32>,
+    heads: BumpVec<'a, u32>,
 
     // Linked list elements.  Has .len() == universe size.
     /*priv*/
-    lists: Vec<LLElem>,
+    lists: BumpVec<'a, LLElem>,
 
     // Keep the typechecker happy
     /*priv*/
@@ -272,14 +273,14 @@ pub struct UnionFindEquivClasses<T: ToFromU32> {
     // carefully designed algorithm, `UnionFind::get_equiv_classes`.
 }
 
-impl<T: ToFromU32> UnionFind<T> {
+impl<'a, T: ToFromU32> UnionFind<'a, T> {
     // This requires mutable `self` because it needs to do a bunch of `find`
     // operations, and those modify `self` in order to perform path compression.
     // We could avoid this by using a non-path-compressing `find` operation, but
     // that could have the serious side effect of making the big-O complexity of
     // `get_equiv_classes` worse.  Hence we play safe and accept the mutability
     // requirement.
-    pub fn get_equiv_classes(&mut self) -> UnionFindEquivClasses<T> {
+    pub fn get_equiv_classes(&mut self, alloc: &Alloc<'a>) -> UnionFindEquivClasses<'a, T> {
         let nElemsUSize = self.parent_or_size.len();
         // The construction algorithm requires that all elements have a value
         // strictly less than 2^31.  The union-find machinery, that builds
@@ -289,10 +290,10 @@ impl<T: ToFromU32> UnionFind<T> {
         let nElems = nElemsUSize as u32;
 
         // Avoid reallocation; we know how big these need to be.
-        let mut heads = Vec::<u32>::new();
+        let mut heads = alloc.vec(nElems as usize);
         heads.resize(nElems as usize, UFEC_NULL); // all invalid
 
-        let mut lists = Vec::<LLElem>::new();
+        let mut lists = alloc.vec(nElems as usize);
         lists.resize(
             nElems as usize,
             LLElem {
@@ -427,7 +428,7 @@ impl<T: ToFromU32> UnionFind<T> {
     }
 }
 
-impl<T: ToFromU32> UnionFindEquivClasses<T> {
+impl<'a, T: ToFromU32> UnionFindEquivClasses<'a, T> {
     // Indicates whether `item1` and `item2` are in the same equivalence
     // class.  If either falls outside the "universe", returns `None`.
     pub fn in_same_equivalence_class(&self, item1: T, item2: T) -> Option<bool> {
@@ -456,17 +457,20 @@ impl<T: ToFromU32> UnionFindEquivClasses<T> {
 // We may want to find the equivalence class for some given element, and
 // iterate through its elements.  This iterator provides that.
 
-pub struct UnionFindEquivClassElemsIter<'a, T: ToFromU32> {
+pub struct UnionFindEquivClassElemsIter<'a, 'arena, T: ToFromU32> {
     // The equivalence classes
     /*priv*/
-    ufec: &'a UnionFindEquivClasses<T>,
+    ufec: &'a UnionFindEquivClasses<'arena, T>,
     // Index into `ufec.lists`, or UFEC_NULL.
     /*priv*/
     next: u32,
 }
 
-impl<T: ToFromU32> UnionFindEquivClasses<T> {
-    pub fn equiv_class_elems_iter<'a>(&'a self, item: T) -> UnionFindEquivClassElemsIter<'a, T> {
+impl<'arena, T: ToFromU32> UnionFindEquivClasses<'arena, T> {
+    pub fn equiv_class_elems_iter<'a>(
+        &'a self,
+        item: T,
+    ) -> UnionFindEquivClassElemsIter<'a, 'arena, T> {
         let mut itemU32 = ToFromU32::to_u32(item);
         assert!((itemU32 as usize) < self.heads.len());
         if (self.heads[itemU32 as usize] & 0x8000_0000) == 0 {
@@ -482,7 +486,7 @@ impl<T: ToFromU32> UnionFindEquivClasses<T> {
     }
 }
 
-impl<'a, T: ToFromU32> Iterator for UnionFindEquivClassElemsIter<'a, T> {
+impl<'a, 'arena, T: ToFromU32> Iterator for UnionFindEquivClassElemsIter<'a, 'arena, T> {
     type Item = T;
     fn next(&mut self) -> Option<Self::Item> {
         if self.next == UFEC_NULL {
@@ -499,17 +503,17 @@ impl<'a, T: ToFromU32> Iterator for UnionFindEquivClassElemsIter<'a, T> {
 // else: a way to enumerate their leaders (some value arbitrarily drawn from
 // each one).  This provides that.
 
-pub struct UnionFindEquivClassLeadersIter<'a, T: ToFromU32> {
+pub struct UnionFindEquivClassLeadersIter<'a, 'arena, T: ToFromU32> {
     // The equivalence classes
     /*priv*/
-    ufec: &'a UnionFindEquivClasses<T>,
+    ufec: &'a UnionFindEquivClasses<'arena, T>,
     // Index into `ufec.heads` of the next unvisited item.
     /*priv*/
     next: u32,
 }
 
-impl<T: ToFromU32> UnionFindEquivClasses<T> {
-    pub fn equiv_class_leaders_iter<'a>(&'a self) -> UnionFindEquivClassLeadersIter<'a, T> {
+impl<'arena, T: ToFromU32> UnionFindEquivClasses<'arena, T> {
+    pub fn equiv_class_leaders_iter<'a>(&'a self) -> UnionFindEquivClassLeadersIter<'a, 'arena, T> {
         UnionFindEquivClassLeadersIter {
             ufec: &self,
             next: 0,
@@ -517,7 +521,7 @@ impl<T: ToFromU32> UnionFindEquivClasses<T> {
     }
 }
 
-impl<'a, T: ToFromU32> Iterator for UnionFindEquivClassLeadersIter<'a, T> {
+impl<'a, 'arena, T: ToFromU32> Iterator for UnionFindEquivClassLeadersIter<'a, 'arena, T> {
     type Item = T;
     fn next(&mut self) -> Option<Self::Item> {
         // Scan forwards through `ufec.heads` to find the next unvisited one which
@@ -597,9 +601,14 @@ mod union_find_test_utils {
 
 #[test]
 fn test_union_find() {
+    use crate::Bump;
+
+    let bump = Bump::new();
+    let alloc = Alloc(&bump);
+
     const UNIV_SIZE: u32 = 8;
-    let mut uf = UnionFind::new(UNIV_SIZE as usize);
-    let mut uf_eclasses = uf.get_equiv_classes();
+    let mut uf = UnionFind::new(UNIV_SIZE as usize, &alloc);
+    let mut uf_eclasses = uf.get_equiv_classes(&alloc);
     union_find_test_utils::test_eclass(&uf_eclasses, 0, &vec![0]);
     union_find_test_utils::test_eclass(&uf_eclasses, 1, &vec![1]);
     union_find_test_utils::test_eclass(&uf_eclasses, 2, &vec![2]);
@@ -611,7 +620,7 @@ fn test_union_find() {
     union_find_test_utils::test_leaders(UNIV_SIZE, &uf_eclasses, &vec![0, 1, 2, 3, 4, 5, 6, 7]);
 
     uf.union(2, 4);
-    uf_eclasses = uf.get_equiv_classes();
+    uf_eclasses = uf.get_equiv_classes(&alloc);
     union_find_test_utils::test_eclass(&uf_eclasses, 0, &vec![0]);
     union_find_test_utils::test_eclass(&uf_eclasses, 1, &vec![1]);
     union_find_test_utils::test_eclass(&uf_eclasses, 2, &vec![4, 2]);
@@ -623,7 +632,7 @@ fn test_union_find() {
     union_find_test_utils::test_leaders(UNIV_SIZE, &uf_eclasses, &vec![0, 1, 2, 3, 5, 6, 7]);
 
     uf.union(5, 3);
-    uf_eclasses = uf.get_equiv_classes();
+    uf_eclasses = uf.get_equiv_classes(&alloc);
     union_find_test_utils::test_eclass(&uf_eclasses, 0, &vec![0]);
     union_find_test_utils::test_eclass(&uf_eclasses, 1, &vec![1]);
     union_find_test_utils::test_eclass(&uf_eclasses, 2, &vec![4, 2]);
@@ -635,7 +644,7 @@ fn test_union_find() {
     union_find_test_utils::test_leaders(UNIV_SIZE, &uf_eclasses, &vec![0, 1, 2, 5, 6, 7]);
 
     uf.union(2, 5);
-    uf_eclasses = uf.get_equiv_classes();
+    uf_eclasses = uf.get_equiv_classes(&alloc);
     union_find_test_utils::test_eclass(&uf_eclasses, 0, &vec![0]);
     union_find_test_utils::test_eclass(&uf_eclasses, 1, &vec![1]);
     union_find_test_utils::test_eclass(&uf_eclasses, 2, &vec![5, 4, 3, 2]);
@@ -687,7 +696,7 @@ fn test_union_find() {
     union_find_test_utils::test_in_same_eclass(&uf_eclasses, 8, 8, None);
 
     uf.union(7, 1);
-    uf_eclasses = uf.get_equiv_classes();
+    uf_eclasses = uf.get_equiv_classes(&alloc);
     union_find_test_utils::test_eclass(&uf_eclasses, 0, &vec![0]);
     union_find_test_utils::test_eclass(&uf_eclasses, 1, &vec![7, 1]);
     union_find_test_utils::test_eclass(&uf_eclasses, 2, &vec![5, 4, 3, 2]);
@@ -699,7 +708,7 @@ fn test_union_find() {
     union_find_test_utils::test_leaders(UNIV_SIZE, &uf_eclasses, &vec![0, 2, 6, 7]);
 
     uf.union(6, 7);
-    uf_eclasses = uf.get_equiv_classes();
+    uf_eclasses = uf.get_equiv_classes(&alloc);
     union_find_test_utils::test_eclass(&uf_eclasses, 0, &vec![0]);
     union_find_test_utils::test_eclass(&uf_eclasses, 1, &vec![7, 6, 1]);
     union_find_test_utils::test_eclass(&uf_eclasses, 2, &vec![5, 4, 3, 2]);
@@ -711,7 +720,7 @@ fn test_union_find() {
     union_find_test_utils::test_leaders(UNIV_SIZE, &uf_eclasses, &vec![0, 2, 6]);
 
     uf.union(4, 1);
-    uf_eclasses = uf.get_equiv_classes();
+    uf_eclasses = uf.get_equiv_classes(&alloc);
     union_find_test_utils::test_eclass(&uf_eclasses, 0, &vec![0]);
     union_find_test_utils::test_eclass(&uf_eclasses, 1, &vec![7, 6, 5, 4, 3, 2, 1]);
     union_find_test_utils::test_eclass(&uf_eclasses, 2, &vec![7, 6, 5, 4, 3, 2, 1]);
@@ -723,7 +732,7 @@ fn test_union_find() {
     union_find_test_utils::test_leaders(UNIV_SIZE, &uf_eclasses, &vec![0, 6]);
 
     uf.union(0, 3);
-    uf_eclasses = uf.get_equiv_classes();
+    uf_eclasses = uf.get_equiv_classes(&alloc);
     union_find_test_utils::test_eclass(&uf_eclasses, 0, &vec![7, 6, 5, 4, 3, 2, 1, 0]);
     union_find_test_utils::test_eclass(&uf_eclasses, 1, &vec![7, 6, 5, 4, 3, 2, 1, 0]);
     union_find_test_utils::test_eclass(&uf_eclasses, 2, &vec![7, 6, 5, 4, 3, 2, 1, 0]);
@@ -736,7 +745,7 @@ fn test_union_find() {
 
     // Pointless, because the classes are already maximal.
     uf.union(1, 2);
-    uf_eclasses = uf.get_equiv_classes();
+    uf_eclasses = uf.get_equiv_classes(&alloc);
     union_find_test_utils::test_eclass(&uf_eclasses, 0, &vec![7, 6, 5, 4, 3, 2, 1, 0]);
     union_find_test_utils::test_eclass(&uf_eclasses, 1, &vec![7, 6, 5, 4, 3, 2, 1, 0]);
     union_find_test_utils::test_eclass(&uf_eclasses, 2, &vec![7, 6, 5, 4, 3, 2, 1, 0]);

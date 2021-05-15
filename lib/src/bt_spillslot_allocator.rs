@@ -10,6 +10,7 @@ use crate::data_structures::{
 };
 use crate::union_find::UnionFindEquivClasses;
 use crate::Function;
+use crate::{Alloc, BumpVec};
 
 //=============================================================================
 // A spill slot allocator.  This could be implemented more simply than it is.
@@ -505,8 +506,12 @@ impl SpillSlotAllocator {
 
     /// Stackmap support: Examine all the spill slots at `pt` and return those that are reftyped.
     /// This is fundamentally what creates a stack map.
-    pub(crate) fn get_reftyped_spillslots_at_inst_point(&self, pt: InstPoint) -> Vec<SpillSlot> {
-        let mut res = Vec::<SpillSlot>::new();
+    pub(crate) fn get_reftyped_spillslots_at_inst_point<'a>(
+        &self,
+        pt: InstPoint,
+        alloc: &Alloc<'a>,
+    ) -> BumpVec<'a, SpillSlot> {
+        let mut res = alloc.vec(16);
         for (i, slot) in self.slots.iter().enumerate() {
             if slot.get_refness_at_inst_point(pt) == Some(true) {
                 res.push(SpillSlot::new(i as u32));

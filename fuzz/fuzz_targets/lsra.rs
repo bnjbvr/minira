@@ -28,6 +28,8 @@ fuzz_target!(|func: ir::Func| {
     let reg_universe = ir::make_universe(num_regs, num_regs);
 
     let sri = func.get_stackmap_request();
+    let bump = regalloc::Bump::new();
+    let alloc = regalloc::Alloc(&bump);
     let result = match regalloc::allocate_registers_with_opts(
         &mut func,
         &reg_universe,
@@ -36,6 +38,7 @@ fuzz_target!(|func: ir::Func| {
             run_checker: true,
             algorithm: regalloc::Algorithm::LinearScan(Default::default()),
         },
+        &alloc,
     ) {
         Ok(result) => {
             unsafe {
