@@ -22,7 +22,7 @@ path = "./bin/minira_lib.rs"
 
 [dependencies]
 regalloc =  { path = "./lib", features = ["fuzzing", "enable-serde"] }
-arbitrary = { version = "0.4.0", features = ["derive"]}
+arbitrary = { version = "1.0.0", features = ["derive"]}
 rustc-hash = "1.0.1"
 log = { version = "0.4.8", default-features = false }
 pretty_env_logger = "0.4.0"
