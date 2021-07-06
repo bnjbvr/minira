@@ -7,7 +7,7 @@ use crate::{
     Function, RealReg, Reg, SpillSlot, TypedIxVec, VirtualReg, Writable,
 };
 
-use log::{debug, info, trace};
+use log::{debug, trace};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::fmt;

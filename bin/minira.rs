@@ -222,7 +222,7 @@ fn run_snapshot(path: &str, opts: Options, quiet: bool) {
                 }
             }
             Ok(())
-        };
+        }
 
         visit_dirs(path, quiet, &mut snapshots, &mut deserialize_one)
             .expect("couldn't read at least one directory entry");

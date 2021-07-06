@@ -365,7 +365,7 @@ impl FuzzingEnv {
     }
 }
 
-impl Arbitrary for Func {
+impl Arbitrary<'_> for Func {
     fn arbitrary(u: &mut Unstructured) -> arbitrary::Result<Func> {
         let num_virtual_regs = 1 + (u16::arbitrary(u)? % NUM_VREGS);
         let num_reftyped_regs = 1 + (u16::arbitrary(u)? % NUM_VREGS);

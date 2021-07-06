@@ -8,23 +8,11 @@ use crate::{
     VirtualReg, NUM_REG_CLASSES,
 };
 
-use log::{debug, info, log_enabled, trace, Level};
+use log::{debug, log_enabled, trace, Level};
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::collections::BinaryHeap;
 use std::{cmp, cmp::Ordering, fmt};
-
-macro_rules! lsra_assert {
-    ($arg:expr) => {
-        #[cfg(debug_assertions)]
-        debug_assert!($arg);
-    };
-
-    ($arg:expr, $text:expr) => {
-        #[cfg(debug_assertions)]
-        debug_assert!($arg, $text);
-    };
-}
 
 #[derive(Clone, Copy, PartialEq)]
 enum ActiveInt {
@@ -98,7 +86,7 @@ impl ActivityTracker {
                         to_delete.push(i);
                     } else {
                         // Stays active.
-                        lsra_assert!(int.covers(start), "no active to inactive transition");
+                        debug_assert!(int.covers(start), "no active to inactive transition");
                     }
                 }
 
@@ -116,12 +104,12 @@ impl ActivityTracker {
                         to_delete.push(i);
                     } else if start < frags[*fix].first {
                         // It is now inactive.
-                        lsra_assert!(!frags[*fix].contains(&start));
+                        debug_assert!(!frags[*fix].contains(&start));
                         new_inactive.push((*rreg, *fix));
                         to_delete.push(i);
                     } else {
                         // Otherwise, it's still active.
-                        lsra_assert!(frags[*fix].contains(&start));
+                        debug_assert!(frags[*fix].contains(&start));
                     }
                 }
             }
@@ -146,12 +134,12 @@ impl ActivityTracker {
                 to_delete.push(i);
             } else if start >= frags[*fix].first {
                 // It is now active.
-                lsra_assert!(frags[*fix].contains(&start));
+                debug_assert!(frags[*fix].contains(&start));
                 self.active.push(ActiveInt::Fixed((*rreg, *fix)));
                 to_delete.push(i);
             } else {
                 // Otherwise it remains inactive.
-                lsra_assert!(!frags[*fix].contains(&start));
+                debug_assert!(!frags[*fix].contains(&start));
             }
         }
 
@@ -272,10 +260,10 @@ impl<T: Copy> RegisterMapping<T> {
         let mut offset = 0;
         // Collect all the registers for the current class.
         if let Some(ref info) = reg_universe.allocable_by_class[reg_class_index] {
-            lsra_assert!(info.first <= info.last);
+            debug_assert!(info.first <= info.last);
             offset = info.first;
             for reg in &reg_universe.regs[info.first..=info.last] {
-                lsra_assert!(regs.len() == reg.0.get_index() - offset);
+                debug_assert!(regs.len() == reg.0.get_index() - offset);
                 regs.push((reg.0, initial_value));
             }
         };
@@ -327,13 +315,14 @@ impl<'a, T: Copy> std::iter::Iterator for RegisterMappingIter<'a, T> {
 impl<T> std::ops::Index<RealReg> for RegisterMapping<T> {
     type Output = T;
     fn index(&self, rreg: RealReg) -> &Self::Output {
-        lsra_assert!(
+        debug_assert!(
             rreg.get_class() as usize == self.reg_class_index,
             "trying to index a reg from the wrong class"
         );
-        lsra_assert!(
+        debug_assert!(
             Some(rreg) != self.scratch,
-            format!("trying to const-use the scratch of {:?}", rreg.get_class())
+            "trying to const-use the scratch of {:?}",
+            rreg.get_class()
         );
         &self.regs[rreg.get_index() - self.offset].1
     }
@@ -341,13 +330,14 @@ impl<T> std::ops::Index<RealReg> for RegisterMapping<T> {
 
 impl<T> std::ops::IndexMut<RealReg> for RegisterMapping<T> {
     fn index_mut(&mut self, rreg: RealReg) -> &mut Self::Output {
-        lsra_assert!(
+        debug_assert!(
             rreg.get_class() as usize == self.reg_class_index,
             "trying to index a reg from the wrong class"
         );
-        lsra_assert!(
+        debug_assert!(
             Some(rreg) != self.scratch,
-            format!("trying to mut-use the scratch of {:?}", rreg.get_class())
+            "trying to mut-use the scratch of {:?}",
+            rreg.get_class()
         );
         &mut self.regs[rreg.get_index() - self.offset].1
     }
@@ -438,7 +428,7 @@ impl UnhandledIntervals {
     fn next_unhandled(&mut self, _intervals: &Intervals) -> Option<IntId> {
         self.heap.pop().map(|entry| {
             let ret = entry.0;
-            lsra_assert!(_intervals.get(ret).start == entry.1);
+            debug_assert!(_intervals.get(ret).start == entry.1);
             ret
         })
     }
@@ -631,7 +621,7 @@ fn select_naive_reg<F: Function>(
 
     // Shortcut: if all the registers are taken, don't even bother.
     if num_free == 0 {
-        lsra_assert!(!free_until_pos
+        debug_assert!(!free_until_pos
             .iter()
             .any(|pair| pair.1 != InstPoint::min_value()));
         return None;
@@ -888,7 +878,7 @@ fn allocate_blocked_reg<F: Function>(
                 }
 
                 ActiveInt::Fixed((_reg, _fix)) => {
-                    lsra_assert!(
+                    debug_assert!(
                         _reg != best_reg
                             || state.intervals.get(cur_id).end
                                 < state.intervals.fixeds[_reg.get_index()].frags[_fix].first,
@@ -928,7 +918,7 @@ fn maybe_handle_safepoints<F: Function>(state: &mut State<F>, id: IntId) -> bool
         None => return true,
     };
 
-    lsra_assert!(int.start.iix() <= sp_iix && sp_iix <= int.end.iix());
+    debug_assert!(int.start.iix() <= sp_iix && sp_iix <= int.end.iix());
 
     let sp_def = InstPoint::new_def(sp_iix);
     if let Some(prev_use) = last_use(&state.intervals.get(id), sp_def, &state.reg_uses) {
